@@ -21,8 +21,8 @@ function prep(source) {
   return source
     .replace(/import fs from '@ohos\.file\.fs';\n/,
       "const fs = { openSync() { throw new Error('unused'); }, statSync() { return { size: 0 }; }, readSync() {}, writeSync() {}, closeSync() {}, renameSync() {}, unlinkSync() {}, mkdirSync() {} };\n")
-    .replace(/import \{ hilog \} from '@kit\.PerformanceAnalysisKit';\n/,
-      "const hilog = { error() {}, info() {}, warn() {} };\n")
+    .replace(/import \{ hilog \} from '@kit\.PerformanceAnalysisKit';\n/g,
+      "const hilog = { error(domain, tag, message) { const bag = globalThis; if (!Array.isArray(bag.__centerHilog)) { bag.__centerHilog = []; } bag.__centerHilog.push(String(message)); }, info() {}, warn() {} };\n")
     .replaceAll("from '../center/CenterLimits'", "from './CenterLimits.ts'")
     .replaceAll("from '../center/Clock'", "from './Clock.ts'")
     .replaceAll("from '../center/CenterTypes'", "from './CenterTypes.ts'")

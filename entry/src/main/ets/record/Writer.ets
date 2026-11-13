@@ -4,10 +4,12 @@ import { nowIso } from '../center/Clock';
 import { jobMax, listMax } from '../center/CenterLimits';
 import type {
   CacheRow,
+  CleanReport,
   ExamReport,
   ExamState,
   ExamSummary,
   FileHit,
+  FileToolReport,
   JobRecord,
   JobState,
   PermissionFact,
@@ -19,9 +21,14 @@ import type { HomeCandidate } from '../feature/exam/ExamState'
 
 const DOMAIN: number = 0x4A59
 const TAG: string = 'Center'
+/** filesDir 内相对路径。 */
 const INDEX_PATH: string = 'center/jobs/index.json'
 const MANY: string = '结果较多，仅显示部分'
+const LIMIT_NOTE: string = '已达本次扫描上限'
 const INTERRUPTED: string = '扫描已中断'
+const SCAN_ORDER: string[] = [LIMIT_NOTE, MANY, '目录未授权，未扫描', '授权已失效']
+const CLEAN_ORDER: string[] = [LIMIT_NOTE, MANY, '无法读取其他应用缓存', '请先选择目录']
+const FILE_ORDER: string[] = [LIMIT_NOTE, MANY]
 
 export interface CenterFiles {
   read(path: string): string | null
@@ -72,6 +79,20 @@ class ExamStub implements ExamReport {
 class Candidate implements HomeCandidate {
   record: JobRecord = new IndexRow()
   report: ExamReport | null = null
+}
+
+class DiskRecord implements JobRecord {
+  jobId: string = ''
+  seq: number = 0
+  kind: JobRecord['kind'] = 'exam'
+  lane: JobRecord['lane'] = 'heavy'
+  startedAt: string = ''
+  finishedAt: string = ''
+  state: JobState = 'done'
+  itemCount: number = 0
+  riskCount: number = 0
+  summary: string = ''
+  resultFile: string = ''
 }
 
 class SplitHits {
@@ -259,14 +280,13 @@ export class Writer {
     return row
   }
 
-  private static plainIndex(records: IndexRow[]): JobRecord[] {
-    let plain: JobRecord[] = []
+  private static plainIndex(records: IndexRow[]): DiskRecord[] {
+    let plain: DiskRecord[] = []
     for (let i = 0; i < records.length; i++) {
       let row = records[i]
-      let copy = new IndexRow()
+      let copy = new DiskRecord()
       copy.jobId = row.jobId
       copy.seq = row.seq
-      copy.seqPresent = true
       copy.kind = row.kind
       copy.lane = row.lane
       copy.startedAt = row.startedAt
@@ -388,11 +408,42 @@ export class Writer {
     }
   }
 
+  static resultFileOf(jobId: string): string {
+    return 'center/jobs/' + jobId + '.json'
+  }
+
+  static commit(record: JobRecord, text: string): void {
+    Writer.exclusive(() => {
+      Writer.commitNow(record, text)
+    })
+  }
+
+  private static commitNow(record: JobRecord, text: string): void {
+    if (Writer.files === null || record.jobId.length === 0) {
+      return
+    }
+    let path = Writer.resultFileOf(record.jobId)
+    record.resultFile = path
+    Writer.replaceNow(path, text)
+    let rows = Writer.readIndex()
+    let found = false
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i].jobId === record.jobId) {
+        rows[i].resultFile = path
+        rows[i].summary = record.summary
+        found = true
+      }
+    }
+    if (found) {
+      Writer.replaceNow(INDEX_PATH, JSON.stringify(Writer.plainIndex(rows)))
+    }
+  }
+
   private static resultPath(record: JobRecord): string {
     if (record.resultFile.length > 0) {
       return record.resultFile
     }
-    return 'center/jobs/' + record.jobId + '.json'
+    return Writer.resultFileOf(record.jobId)
   }
 
   private static removeResult(record: JobRecord): void {
@@ -407,11 +458,23 @@ export class Writer {
 }
 
 export function limitScanReport(report: ScanReport, finishing: boolean): void {
+  let judged = report.judged
+  let risk = report.risk
+  let suspicious = report.suspicious
+  let unknown = report.unknown
+  let ok = report.ok
   let split = splitHits(report.hits)
   report.hits = joinHits(split)
+  report.judged = judged
+  report.risk = risk
+  report.suspicious = suspicious
+  report.unknown = unknown
+  report.ok = ok
   if (split.droppedUnknown) {
     report.complete = false
-    report.note = appendNote(report.note)
+    report.note = orderNote(report.note, MANY, SCAN_ORDER)
+  } else {
+    report.note = orderNote(report.note, '', SCAN_ORDER)
   }
   let sum = report.risk + report.suspicious + report.unknown + report.ok
   if (finishing && report.judged !== sum) {
@@ -421,8 +484,16 @@ export function limitScanReport(report: ScanReport, finishing: boolean): void {
 }
 
 export function limitExamApps(report: ExamReport, record: JobRecord): void {
+  let riskApps = report.summary.riskApps
+  let suspiciousApps = report.summary.suspiciousApps
+  let unknownApps = report.summary.unknownApps
+  let okApps = report.summary.okApps
   let split = splitHits(report.apps)
   report.apps = joinHits(split)
+  report.summary.riskApps = riskApps
+  report.summary.suspiciousApps = suspiciousApps
+  report.summary.unknownApps = unknownApps
+  report.summary.okApps = okApps
   if (split.droppedUnknown) {
     report.appsComplete = false
     record.summary = MANY
@@ -451,7 +522,29 @@ export function fileToolNote(hits: FileHit[], note: string): string {
   if (hits.length <= listMax) {
     return note
   }
-  return appendNote(note)
+  return orderNote(note, MANY, FILE_ORDER)
+}
+
+export function normalizeClean(report: CleanReport): void {
+  clearCacheSelection(report.caches)
+  let over = report.caches.length > listMax || report.hits.length > listMax || report.groups.length > listMax
+  if (over) {
+    report.complete = false
+  }
+  report.note = orderNote(report.note, over ? MANY : '', CLEAN_ORDER)
+  report.caches = limitRows(report.caches)
+  report.hits = limitFileHits(report.hits, report.complete, report.note)
+  report.groups = limitRows(report.groups)
+}
+
+export function normalizeFileTool(report: FileToolReport): void {
+  let over = report.hits.length > listMax || report.groups.length > listMax
+  if (over) {
+    report.complete = false
+  }
+  report.note = orderNote(report.note, over ? MANY : '', FILE_ORDER)
+  report.hits = limitFileHits(report.hits, report.complete, report.note)
+  report.groups = limitRows(report.groups)
 }
 
 export function clearCacheSelection(rows: CacheRow[]): void {
@@ -538,14 +631,73 @@ function joinHits(split: SplitHits): ScanHit[] {
   return kept
 }
 
-function appendNote(note: string): string {
-  if (note.indexOf(MANY) >= 0) {
-    return note
+export function limitRows<T>(rows: T[]): T[] {
+  if (rows.length <= listMax) {
+    return rows
   }
-  if (note.length === 0) {
-    return MANY
+  let kept: T[] = []
+  for (let i = 0; i < listMax; i++) {
+    kept.push(rows[i])
   }
-  return note + '、' + MANY
+  return kept
+}
+
+function orderNote(note: string, extra: string, order: string[]): string {
+  let parts = splitNote(note)
+  if (extra.length > 0) {
+    let has = false
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === extra) {
+        has = true
+      }
+    }
+    if (!has) {
+      parts.push(extra)
+    }
+  }
+  let used: boolean[] = []
+  for (let i = 0; i < parts.length; i++) {
+    used.push(false)
+  }
+  let out: string[] = []
+  for (let s = 0; s < order.length; s++) {
+    let include = false
+    for (let i = 0; i < parts.length; i++) {
+      if (parts[i] === order[s]) {
+        used[i] = true
+        include = true
+      }
+    }
+    if (include) {
+      out.push(order[s])
+    }
+  }
+  for (let i = 0; i < parts.length; i++) {
+    if (!used[i]) {
+      out.push(parts[i])
+    }
+  }
+  return out.join('、')
+}
+
+function splitNote(note: string): string[] {
+  let parts: string[] = []
+  let buf = ''
+  for (let i = 0; i < note.length; i++) {
+    let ch = note.charAt(i)
+    if (ch === '、' || ch === ',') {
+      if (buf.length > 0) {
+        parts.push(buf)
+      }
+      buf = ''
+    } else {
+      buf += ch
+    }
+  }
+  if (buf.length > 0) {
+    parts.push(buf)
+  }
+  return parts
 }
 
 export class SandboxFiles implements CenterFiles {
