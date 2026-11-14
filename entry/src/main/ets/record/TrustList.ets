@@ -6,6 +6,7 @@ import { Writer } from './Writer';
 
 const DOMAIN: number = 0x4A59
 const TAG: string = 'Center'
+/** filesDir 内相对路径，对应 filesDir/center/trust.json。 */
 const TRUST_PATH: string = 'center/trust.json'
 
 class TrustRow implements TrustEntry {
@@ -44,19 +45,20 @@ export class TrustList {
   }
 
   static trustFile(sha256: string, uri: string): boolean {
-    if (sha256.length === 0) {
+    let fingerprint = canonicalCert(sha256)
+    if (fingerprint.length === 0) {
       return false
     }
     let rows = TrustList.readRows()
     if (rows === null) {
       return false
     }
-    if (TrustList.findFile(rows, sha256) >= 0) {
+    if (TrustList.findFile(rows, fingerprint) >= 0) {
       return true
     }
     let row = new TrustRow()
     row.kind = 'file-sha256'
-    row.fingerprint = sha256
+    row.fingerprint = fingerprint
     row.id = uri
     row.versionCode = 0
     row.at = nowIso()
@@ -78,14 +80,15 @@ export class TrustList {
   }
 
   static matchesFile(sha256: string): boolean {
-    if (sha256.length === 0) {
+    let fingerprint = canonicalCert(sha256)
+    if (fingerprint.length === 0) {
       return false
     }
     let rows = TrustList.readRows()
     if (rows === null) {
       return false
     }
-    return TrustList.findFile(rows, sha256) >= 0
+    return TrustList.findFile(rows, fingerprint) >= 0
   }
 
   private static findBundle(rows: TrustRow[], fingerprint: string, bundleName: string, versionCode: number): number {

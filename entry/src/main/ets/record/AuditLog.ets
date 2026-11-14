@@ -2,6 +2,7 @@ import type { AuditLine } from '../center/CenterTypes';
 import { nowIso } from '../center/Clock';
 import { Writer } from './Writer';
 
+/** filesDir 内相对路径，对应 filesDir/center/audit.log。 */
 const AUDIT_PATH: string = 'center/audit.log'
 const SUCCESS: string = '成功'
 

@@ -152,6 +152,29 @@ export function runTrustAuditChecks(): void {
   if (filesOnly !== 1) {
     fail('同一哈希增加了第二条文件信任')
   }
+  let beforeBlank = trustRows(files).length
+  if (TrustList.trustFile('   ', 'file://blank') || trustRows(files).length !== beforeBlank) {
+    fail('空文件哈希被写进了信任区')
+  }
+  if (!TrustList.trustFile('AA:BB', 'file://restore')) {
+    fail('文件哈希没有写入')
+  }
+  if (!TrustList.trustFile('aa bb', 'file://other') || !TrustList.matchesFile('AA-BB')) {
+    fail('规范化后的同一文件哈希没有命中')
+  }
+  let restored = 0
+  let fileRows = trustRows(files)
+  for (let i = 0; i < fileRows.length; i++) {
+    if (fileRows[i].kind === 'file-sha256' && fileRows[i].fingerprint === 'aabb') {
+      restored++
+      if (fileRows[i].id !== 'file://restore' || fileRows[i].versionCode !== 0) {
+        fail('文件条目没有留下 uri，或 versionCode 不是 0')
+      }
+    }
+  }
+  if (restored !== 1 || files.read(TRUST) === null || (files.read(TRUST) as string).charAt(0) !== '[') {
+    fail('同一文件哈希写了第二条，或 trust.json 不是 TrustEntry[]')
+  }
 
   files.write(TRUST, '{')
   if (TrustList.trustBundle(HEX64, algo, 'com.example.app', 1) || files.read(TRUST) !== '{') {
@@ -179,6 +202,13 @@ export function runTrustAuditChecks(): void {
     if (logged[i].action !== ACTIONS[i] || logged[i].result !== '成功') {
       fail('审计动作或成功结果丢了')
     }
+  }
+  let firstLine = kept.split('\n')[0]
+  let first = JSON.parse(firstLine) as Line
+  if (first.at.length === 0 || first.kind !== 'exam' || first.action !== '作业完成' ||
+    first.jobId !== 'job-1' || first.target !== 'com.example.app' || first.result !== '成功' ||
+    firstLine.indexOf('"content"') >= 0) {
+    fail('审计不是 AuditLine 的 JSON 行，或 target 写进了文件内容')
   }
   fresh.write(AUDIT, kept + '{"at":')
   if (AuditLog.read().length !== ACTIONS.length) {
@@ -212,7 +242,19 @@ export function runTrustAuditChecks(): void {
     fail('失败把成功结果写进了审计')
   }
   let failureRows = AuditLog.read()
-  if (failureRows.length !== 1 || failureRows[0].action !== '卸载' || failureRows[0].result === '成功') {
+  if (failureRows.length !== 1 || failureRows[0].action !== '卸载' || failureRows[0].result === '成功' ||
+    failureRows[0].result === '失败') {
     fail('失败的卸载没有留下一条非成功的审计')
+  }
+  let coded = new Line()
+  coded.action = '卸载'
+  coded.result = '返回码 13'
+  coded.target = 'file://pkg'
+  AuditLog.append(coded, false)
+  let codedRows = AuditLog.read()
+  let codedText = failed.read(AUDIT)
+  if (codedRows.length !== 2 || codedRows[1].result !== '返回码 13' || codedRows[1].target !== 'file://pkg' ||
+    codedText === null || codedText.indexOf('"target":"file://pkg"') < 0 || codedText.indexOf('成功') >= 0) {
+    fail('失败说明没有按 JSON 行留下，或 target 不是 uri')
   }
 }
