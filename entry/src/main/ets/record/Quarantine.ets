@@ -122,26 +122,45 @@ export class Quarantine {
     let entry: CenterError | Row | null = null
     try {
       let plain = this.bytes.read(from)
-      if (plain === null || !this.bytes.write(temp, plain)) {
+      if (plain === null) {
+        entry = this.error('io', from)
+        return entry
+      }
+      if (!this.bytes.write(temp, plain)) {
+        this.bytes.remove(temp)
         entry = this.error('io', from)
         return entry
       }
       let digest = sha256Hex(plain)
       if (sha256.length > 0 && sha256 !== digest) {
+        this.bytes.remove(temp)
         entry = this.error('io', from)
         return entry
       }
       let seal = this.cipher.encrypt(KEY_ALIAS, KEY_BITS, plain)
       if (seal === null || !this.bytes.write(blob, seal.bytes)) {
         this.bytes.remove(blob)
+        this.bytes.remove(temp)
         entry = this.error('io', blob)
         return entry
       }
+      let counted = plain.length > size ? plain.length : size
+      if (counted > size) {
+        let again = Writer.exclusive(() => {
+          return this.quotaState(counted)
+        })
+        if (again !== 0) {
+          this.bytes.remove(blob)
+          this.bytes.remove(temp)
+          entry = again === 1 ? this.error('quota', '') : this.error('io', MANIFEST)
+          return entry
+        }
+      }
+      this.bytes.remove(temp)
       let iv = seal.iv
       let tag = seal.tag
-      let plainSize = plain.length
       let saved = Writer.exclusive(() => {
-        return this.appendUncommitted(id, from, digest, plainSize, iv, tag, reason)
+        return this.appendUncommitted(id, from, digest, counted, iv, tag, reason)
       })
       if (saved === null) {
         this.bytes.remove(blob)

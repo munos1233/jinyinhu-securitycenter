@@ -7,9 +7,16 @@ import { fileURLToPath } from 'node:url'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '../../..')
+const EXCLUDE = '/data/storage/el2/base/files/center/quarantine'
 const backup = JSON.parse(readFileSync(resolve(root, 'entry/src/main/resources/base/profile/backup_config.json'), 'utf8'))
-if (backup.allowToBackupRestore !== false) {
-  process.stderr.write('隔离区无法排除时仍允许整包备份\n')
+const excludes = Array.isArray(backup.excludes) ? backup.excludes : null
+if (excludes === null) {
+  if (backup.allowToBackupRestore !== false) {
+    process.stderr.write('没有 excludes 时不能整包备份\n')
+    process.exit(1)
+  }
+} else if (backup.allowToBackupRestore !== true || excludes.indexOf(EXCLUDE) < 0) {
+  process.stderr.write('排除路径必须是 ' + EXCLUDE + '\n')
   process.exit(1)
 }
 const ability = readFileSync(resolve(root, 'entry/src/main/ets/entrybackupability/EntryBackupAbility.ets'), 'utf8')

@@ -16,6 +16,7 @@ const ABC: string = 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20
 
 class MemoryFiles implements CenterFiles {
   values: Map<string, string> = new Map()
+  trace: string[] = []
 
   read(path: string): string | null {
     if (!this.values.has(path)) {
@@ -29,6 +30,9 @@ class MemoryFiles implements CenterFiles {
   }
 
   write(path: string, text: string): void {
+    if (path.indexOf('manifest.json') >= 0) {
+      this.trace.push('manifest')
+    }
     this.values.set(path, text)
   }
 
@@ -51,6 +55,7 @@ class MemoryBytes implements ByteStore {
   reads: string[] = []
   failRemove: string = ''
   failWrite: string = ''
+  trace: string[] = []
 
   read(path: string): Uint8Array | null {
     this.reads.push(path)
@@ -78,6 +83,9 @@ class MemoryBytes implements ByteStore {
   }
 
   remove(path: string): boolean {
+    if (path.indexOf('/tmp/') >= 0) {
+      this.trace.push('temp')
+    }
     if (path === this.failRemove) {
       return false
     }
@@ -263,8 +271,8 @@ export function runQuarantineChecks(): void {
   let kept = box1.put(FROM, plain.length, '', '安装包', ROOT, true)
   bytes.failRemove = ''
   if (kept instanceof CenterError || kept.committed || kept.sha256 !== ABC || kept.stored !== ID ||
-    kept.id !== ID || kept.stored.indexOf('.') >= 0 || cipher.alias !== 'jinyinhu.center.quarantine' ||
-    cipher.bits !== 256) {
+    kept.id.length !== 32 || kept.id !== ID || kept.stored.indexOf('.') >= 0 || kept.iv !== 'aXY=' ||
+    kept.tag !== 'dGFn' || cipher.alias !== 'jinyinhu.center.quarantine' || cipher.bits !== 256) {
     fail('删源失败时没有留下 committed=false，或空串哈希没有写入算出的值')
   }
   let listed = rows(files)
@@ -276,7 +284,14 @@ export function runQuarantineChecks(): void {
 
   bytes.values.delete('center/quarantine/blobs/' + ID)
   files.values.delete(MANIFEST)
+  bytes.trace = []
+  files.trace = bytes.trace
   let done = box1.put(FROM, plain.length, ABC, '安装包', ROOT, true)
+  let tempAt = bytes.trace.indexOf('temp')
+  let manifestAt = bytes.trace.indexOf('manifest')
+  if (tempAt < 0 || manifestAt < 0 || tempAt > manifestAt) {
+    fail('临时明文留到了写入 committed=false 之后')
+  }
   if (done instanceof CenterError || !done.committed || done.sha256 !== ABC || bytes.values.has(FROM) === true) {
     fail('删源成功后没有把清单改成 committed=true')
   }
@@ -333,5 +348,32 @@ export function runQuarantineChecks(): void {
   if (moved !== null || rows(files).length !== 0 ||
     !same(bytes.values.get('/storage/other/b.txt') === undefined ? null : bytes.values.get('/storage/other/b.txt') as Uint8Array, plain)) {
     fail('另选目录通过 FileOpen 后没有写回，或写回前就改了清单')
+  }
+
+  let files2 = new MemoryFiles()
+  let bytes2 = new MemoryBytes()
+  let view2 = new MapView()
+  let cipher2 = new FakeCipher()
+  bytes2.values.set(FROM, plain)
+  bytes2.values.set('/storage/users/b.txt', plain)
+  let box2 = box(files2, bytes2, view2, cipher2)
+  bytes2.failWrite = 'center/quarantine/tmp/' + ID
+  let copyFail = box2.put(FROM, plain.length, '', '安装包', ROOT, true)
+  bytes2.failWrite = ''
+  if (!(copyFail instanceof CenterError) || copyFail.code !== 'io' || files2.read(MANIFEST) !== null ||
+    bytes2.values.has('center/quarantine/tmp/' + ID) === true || bytes2.values.has(FROM) !== true) {
+    fail('复制失败不是 io，或留下了临时明文和清单')
+  }
+  let first = box2.put(FROM, quarantineQuota - 1, '', '安装包', ROOT, true)
+  if (first instanceof CenterError || first.size !== quarantineQuota - 1) {
+    fail('第一份不到配额的明文没有记入累计')
+    return
+  }
+  bytes2.values.set(FROM, plain)
+  bytes2.reads = []
+  let second = box2.put('/storage/users/b.txt', 2, '', '安装包', ROOT, true)
+  if (!(second instanceof CenterError) || second.code !== 'quota' || second.message !== '隔离区已满' ||
+    bytes2.reads.indexOf('/storage/users/b.txt') >= 0 || rows(files2).length !== 1) {
+    fail('两份都不到配额、加在一起超过时没有拒绝')
   }
 }
