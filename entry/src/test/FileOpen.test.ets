@@ -81,6 +81,7 @@ export function runFileOpenChecks(): void {
   if (privateBundleSegment('/data/app/el2/base/com.foo/files/a') !== 'com.foo' ||
     privateBundleSegment('/data/service/el1/database/com.bar/db') !== 'com.bar' ||
     privateBundleSegment('/x/database/bbb/base/aaa') !== 'bbb' ||
+    privateBundleSegment('/data/app/base/aaa/database/bbb') !== 'aaa' ||
     privateBundleSegment('/data/service/el1/public/readme') !== '') {
     fail('包名段没有取最靠前的 /base/ 或 /database/')
   }
@@ -101,7 +102,8 @@ export function runFileOpenChecks(): void {
     view.opened.length !== 0 || view.present.get('/storage/users/link') !== true) {
     fail('指向系统目录的符号链接被读取了')
   }
-  if (!rejected(opener.open('/system/bin/sh', '/system', false, none))) {
+  view.opened = []
+  if (!rejected(opener.open('/system/bin/sh', '/system', false, none)) || view.opened.length !== 0) {
     fail('授权根盖过了硬拒绝')
   }
 
@@ -180,6 +182,12 @@ export function runFileOpenChecks(): void {
   view.reveal = '/storage/users/a.txt'
   if (!opened(view, opener.open('content://media/2', '/storage/users', false, grant('content://media/2')))) {
     fail('仍有效的 FileGrant 没有被接受')
+  }
+  view.opened = []
+  view.closed = []
+  view.reveal = null
+  if (!opened(view, opener.open('content://picker/1', '/storage/users', true, none))) {
+    fail('没有路径的选择器 uri 在打开前被拒绝了')
   }
   view.opened = []
   view.closed = []
