@@ -4,7 +4,7 @@ import { nowIso } from '../center/Clock';
 import { CenterError } from '../center/CenterError';
 import { quarantineQuota } from '../center/CenterLimits';
 import type { FileGrant, QuarantineEntry } from '../center/CenterTypes';
-import { FileOpen } from '../system/FileOpen';
+import { FileOpen, OpenedFile } from '../system/FileOpen';
 import type { CenterFiles } from './Writer';
 import { Writer } from './Writer';
 
@@ -29,8 +29,22 @@ export interface QuarantineCipher {
 
 export interface ByteStore {
   read(path: string): Uint8Array | null
+  readFd(fd: number): Uint8Array | null
   write(path: string, data: Uint8Array): boolean
   remove(path: string): boolean
+}
+
+export function bytePath(root: string, path: string): string {
+  if (path.length > 0 && path.charAt(0) === '/') {
+    return path
+  }
+  if (root.length === 0) {
+    return path
+  }
+  if (root.charAt(root.length - 1) === '/') {
+    return root + path
+  }
+  return root + '/' + path
 }
 
 class Row implements QuarantineEntry {
@@ -47,14 +61,26 @@ class Row implements QuarantineEntry {
 }
 
 export class FsByteStore implements ByteStore {
+  root: string
+
+  constructor(root: string) {
+    this.root = root
+  }
+
   read(path: string): Uint8Array | null {
     try {
-      let file = fs.openSync(path, fs.OpenMode.READ_ONLY)
-      let stat = fs.statSync(file.fd)
-      let buffer = new ArrayBuffer(stat.size)
-      fs.readSync(file.fd, buffer)
+      let file = fs.openSync(bytePath(this.root, path), fs.OpenMode.READ_ONLY)
+      let bytes = readWhole(file.fd)
       fs.closeSync(file)
-      return new Uint8Array(buffer)
+      return bytes
+    } catch (err) {
+      return null
+    }
+  }
+
+  readFd(fd: number): Uint8Array | null {
+    try {
+      return readWhole(fd)
     } catch (err) {
       return null
     }
@@ -62,7 +88,15 @@ export class FsByteStore implements ByteStore {
 
   write(path: string, data: Uint8Array): boolean {
     try {
-      let file = fs.openSync(path, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
+      let full = bytePath(this.root, path)
+      let slash = full.lastIndexOf('/')
+      if (slash > 0) {
+        try {
+          fs.mkdirSync(full.substring(0, slash), true)
+        } catch (err) {
+        }
+      }
+      let file = fs.openSync(full, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
       fs.writeSync(file.fd, data.buffer)
       fs.closeSync(file)
       return true
@@ -73,12 +107,22 @@ export class FsByteStore implements ByteStore {
 
   remove(path: string): boolean {
     try {
-      fs.unlinkSync(path)
+      fs.unlinkSync(bytePath(this.root, path))
       return true
     } catch (err) {
       return false
     }
   }
+}
+
+function readWhole(fd: number): Uint8Array {
+  let stat = fs.statSync(fd)
+  if (stat.size <= 0) {
+    return new Uint8Array(0)
+  }
+  let buffer = new ArrayBuffer(stat.size)
+  fs.readSync(fd, buffer)
+  return new Uint8Array(buffer)
 }
 
 export class Quarantine {
@@ -116,35 +160,36 @@ export class Quarantine {
     if (opened instanceof CenterError) {
       return opened
     }
+    let held = opened
     let id = this.ids()
     let temp = TEMP_DIR + id
     let blob = BLOB_DIR + id
-    let entry: CenterError | Row | null = null
     try {
-      let plain = this.bytes.read(from)
+      let plain = this.readOpened(held, from)
       if (plain === null) {
-        entry = this.error('io', from)
-        return entry
+        return this.error('io', from)
       }
       if (!this.bytes.write(temp, plain)) {
         this.bytes.remove(temp)
-        entry = this.error('io', from)
-        return entry
+        return this.error('io', from)
       }
-      let digest = sha256Hex(plain)
+      let copied = this.bytes.read(temp)
+      if (copied === null) {
+        this.bytes.remove(temp)
+        return this.error('io', from)
+      }
+      let digest = sha256Hex(copied)
       if (sha256.length > 0 && sha256 !== digest) {
         this.bytes.remove(temp)
-        entry = this.error('io', from)
-        return entry
+        return this.error('io', from)
       }
-      let seal = this.cipher.encrypt(KEY_ALIAS, KEY_BITS, plain)
+      let seal = this.cipher.encrypt(KEY_ALIAS, KEY_BITS, copied)
       if (seal === null || !this.bytes.write(blob, seal.bytes)) {
         this.bytes.remove(blob)
         this.bytes.remove(temp)
-        entry = this.error('io', blob)
-        return entry
+        return this.error('io', blob)
       }
-      let counted = plain.length > size ? plain.length : size
+      let counted = copied.length > size ? copied.length : size
       if (counted > size) {
         let again = Writer.exclusive(() => {
           return this.quotaState(counted)
@@ -152,8 +197,7 @@ export class Quarantine {
         if (again !== 0) {
           this.bytes.remove(blob)
           this.bytes.remove(temp)
-          entry = again === 1 ? this.error('quota', '') : this.error('io', MANIFEST)
-          return entry
+          return again === 1 ? this.error('quota', '') : this.error('io', MANIFEST)
         }
       }
       this.bytes.remove(temp)
@@ -164,23 +208,21 @@ export class Quarantine {
       })
       if (saved === null) {
         this.bytes.remove(blob)
-        entry = this.error('io', MANIFEST)
-        return entry
+        return this.error('io', MANIFEST)
       }
-      if (!this.bytes.remove(from)) {
-        entry = saved
-        return entry
+      let source = held.path.length > 0 ? held.path : from
+      if (!this.bytes.remove(source)) {
+        return saved
       }
       let committed = Writer.exclusive(() => {
         return this.markCommitted(id)
       })
       if (committed === null) {
-        entry = this.error('io', MANIFEST)
-        return entry
+        return this.error('io', MANIFEST)
       }
-      entry = committed
-      return entry
+      return committed
     } finally {
+      this.opener.release(held)
       this.bytes.remove(temp)
     }
   }
@@ -191,19 +233,6 @@ export class Quarantine {
     })
     if (found === null) {
       return this.error('io', id)
-    }
-    let grants: FileGrant[] = []
-    let dest = found.from
-    let opened = this.opener.open(found.from, root, false, grants)
-    if (opened instanceof CenterError) {
-      if (choose.length === 0) {
-        return opened
-      }
-      opened = this.opener.open(choose, root, false, grants)
-      if (opened instanceof CenterError) {
-        return opened
-      }
-      dest = choose
     }
     let temp = TEMP_DIR + 'restore-' + id
     try {
@@ -218,10 +247,18 @@ export class Quarantine {
       if (!this.bytes.write(temp, plain)) {
         return this.error('io', temp)
       }
-      if (sha256Hex(plain) !== found.sha256) {
+      let copied = this.bytes.read(temp)
+      if (copied === null) {
+        return this.error('io', temp)
+      }
+      if (sha256Hex(copied) !== found.sha256) {
         return this.error('io', found.sha256)
       }
-      if (!this.bytes.write(dest, plain)) {
+      let dest = this.destination(found.from, root, choose)
+      if (dest instanceof CenterError) {
+        return dest
+      }
+      if (!this.bytes.write(dest, copied)) {
         this.bytes.remove(dest)
         return this.error('io', dest)
       }
@@ -323,8 +360,30 @@ export class Quarantine {
     return this.replaceManifest(kept)
   }
 
+  private readOpened(opened: OpenedFile, from: string): Uint8Array | null {
+    let viaFd = this.bytes.readFd(opened.fd)
+    if (viaFd !== null) {
+      return viaFd
+    }
+    if (opened.path.length > 0) {
+      return this.bytes.read(opened.path)
+    }
+    return this.bytes.read(from)
+  }
+
+  private destination(from: string, root: string, choose: string): CenterError | string {
+    let allowed = this.opener.accept(from, root)
+    if (!(allowed instanceof CenterError)) {
+      return allowed
+    }
+    if (choose.length === 0) {
+      return allowed
+    }
+    return this.opener.accept(choose, root)
+  }
+
   private readManifest(): Row[] | null {
-    let text = this.files.read(MANIFEST)
+    let text = Writer.readText(MANIFEST)
     if (text === null || text.length === 0) {
       return []
     }
@@ -344,13 +403,8 @@ export class Quarantine {
   }
 
   private replaceManifest(rows: Row[]): boolean {
-    let temp = MANIFEST + '.tmp'
-    this.files.write(temp, JSON.stringify(rows))
-    if (this.files.read(MANIFEST) !== null) {
-      this.files.remove(MANIFEST)
-    }
-    this.files.rename(temp, MANIFEST)
-    return this.files.read(MANIFEST) !== null
+    Writer.replaceText(MANIFEST, JSON.stringify(rows))
+    return Writer.readText(MANIFEST) !== null
   }
 
   private error(code: 'unsupported' | 'quota' | 'io', raw: string): CenterError {

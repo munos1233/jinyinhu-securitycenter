@@ -81,7 +81,6 @@ export class RulePack {
       }
       let empty = new RuleLoad()
       empty.rulesVersion = NONE
-      RulePack.current = empty
       return empty
     }
     parsed.notice = ''

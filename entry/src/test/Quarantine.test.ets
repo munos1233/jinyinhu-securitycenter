@@ -3,8 +3,9 @@ import { quarantineQuota } from '../main/ets/center/CenterLimits'
 import type { FileGrant, QuarantineEntry } from '../main/ets/center/CenterTypes'
 import type { FileView } from '../main/ets/system/FileOpen'
 import { FileOpen } from '../main/ets/system/FileOpen'
-import type { ByteStore, CipherText, QuarantineCipher } from '../main/ets/record/Quarantine'
-import { Quarantine } from '../main/ets/record/Quarantine'
+import type { CipherText, QuarantineCipher } from '../main/ets/record/Quarantine'
+import { bytePath, Quarantine } from '../main/ets/record/Quarantine'
+import type { ByteStore } from '../main/ets/record/Quarantine'
 import type { CenterFiles } from '../main/ets/record/Writer'
 import { Writer } from '../main/ets/record/Writer'
 
@@ -57,6 +58,10 @@ class MemoryBytes implements ByteStore {
   failWrite: string = ''
   trace: string[] = []
 
+  readFd(fd: number): Uint8Array | null {
+    return null
+  }
+
   read(path: string): Uint8Array | null {
     this.reads.push(path)
     if (!this.values.has(path)) {
@@ -97,6 +102,7 @@ class MemoryBytes implements ByteStore {
 class MapView implements FileView {
   real: Map<string, string | null> = new Map()
   opened: string[] = []
+  closes: number = 0
 
   realpath(path: string): string | null {
     if (this.real.has(path)) {
@@ -115,6 +121,7 @@ class MapView implements FileView {
   }
 
   close(fd: number): void {
+    this.closes++
   }
 
   pathOf(fd: number): string | null {
@@ -208,6 +215,11 @@ function rows(files: MemoryFiles): QuarantineEntry[] {
 }
 
 export function runQuarantineChecks(): void {
+  let rooted = bytePath('/data/storage/el2/base/files', 'center/quarantine/blobs/' + ID)
+  if (rooted !== '/data/storage/el2/base/files/center/quarantine/blobs/' + ID ||
+    bytePath('/data/storage/el2/base/files', FROM) !== FROM) {
+    fail('隔离密文没有落在 filesDir，或用户文件被改写进沙箱')
+  }
   let plain = bytesOf('abc')
   let files = new MemoryFiles()
   let bytes = new MemoryBytes()
@@ -286,7 +298,11 @@ export function runQuarantineChecks(): void {
   files.values.delete(MANIFEST)
   bytes.trace = []
   files.trace = bytes.trace
+  view.closes = 0
   let done = box1.put(FROM, plain.length, ABC, '安装包', ROOT, true)
+  if (view.closes !== 1) {
+    fail('隔离复制后没有关闭文件')
+  }
   let tempAt = bytes.trace.indexOf('temp')
   let manifestAt = bytes.trace.indexOf('manifest')
   if (tempAt < 0 || manifestAt < 0 || tempAt > manifestAt) {
@@ -375,5 +391,21 @@ export function runQuarantineChecks(): void {
   if (!(second instanceof CenterError) || second.code !== 'quota' || second.message !== '隔离区已满' ||
     bytes2.reads.indexOf('/storage/users/b.txt') >= 0 || rows(files2).length !== 1) {
     fail('两份都不到配额、加在一起超过时没有拒绝')
+  }
+
+  let files3 = new MemoryFiles()
+  let bytes3 = new MemoryBytes()
+  let view3 = new MapView()
+  let cipher3 = new FakeCipher()
+  bytes3.values.set(FROM, plain)
+  let box3 = box(files3, bytes3, view3, cipher3)
+  let viaUri = box3.put('file://' + FROM, plain.length, '', '安装包', ROOT, true)
+  if (viaUri instanceof CenterError || !viaUri.committed || bytes3.values.has(FROM)) {
+    fail('file:// 没有按解析出的路径完成隔离')
+  }
+  let backUri = box3.restore(ID, ROOT, '')
+  if (backUri !== null || !same(bytes3.values.get(FROM) === undefined ? null : bytes3.values.get(FROM) as Uint8Array, plain) ||
+    rows(files3).length !== 0) {
+    fail('源文件已经删除后没有写回原路径')
   }
 }

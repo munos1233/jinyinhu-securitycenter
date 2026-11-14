@@ -69,6 +69,10 @@ export function runRulePackChecks(): void {
     rulesVersionKey !== 'center.rulesVersion') {
     fail('没有上一份时 center.rulesVersion 不是 none')
   }
+  let missingAgain = RulePack.load(null)
+  if (missingAgain.rulesVersion !== 'none' || missingAgain.notice.length !== 0) {
+    fail('还没有成功加载过时，再次读失败被说成仍在用上一份')
+  }
 
   let text = '{' +
     '"version":"2026.1.2",' +

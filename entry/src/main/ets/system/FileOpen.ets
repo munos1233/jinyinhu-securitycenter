@@ -24,26 +24,35 @@ export class FsFileView implements FileView {
   private lastPath: string = ''
 
   realpath(path: string): string | null {
+    let normal = normalizeAbsolute(path)
+    if (normal === null) {
+      return null
+    }
     try {
-      let stat = fs.lstatSync(path)
+      let stat = fs.lstatSync(normal)
       if (stat.isSymbolicLink()) {
         return null
       }
-      return path
+      return normal
     } catch (err) {
-      return null
+      return normal
     }
   }
 
   open(path: string): number | null {
+    let normal = normalizeAbsolute(path)
+    if (normal === null) {
+      return null
+    }
     try {
-      let file = fs.openSync(path, fs.OpenMode.READ_ONLY)
+      let file = fs.openSync(normal, fs.OpenMode.READ_ONLY)
       this.lastFd = file.fd
-      this.lastPath = ''
+      this.lastPath = normal
       try {
-        this.lastPath = file.path
+        if (file.path.length > 0) {
+          this.lastPath = file.path
+        }
       } catch (err) {
-        this.lastPath = ''
       }
       return file.fd
     } catch (err) {
@@ -101,14 +110,45 @@ export class FileOpen {
     if (problem !== null) {
       return problem
     }
-    let fd = this.view.open(parsed)
+    let resolved = this.view.realpath(parsed)
+    if (resolved === null || resolved.length === 0) {
+      return reject(parsed)
+    }
+    let fd = this.view.open(resolved)
     if (fd === null) {
-      return ioError(parsed)
+      return ioError(resolved)
     }
     let opened = new OpenedFile()
     opened.fd = fd
-    opened.path = parsed
+    opened.path = resolved
     return opened
+  }
+
+  accept(uri: string, root: string): CenterError | string {
+    let parsed = pathOfUri(uri)
+    if (parsed === null) {
+      return reject(uri)
+    }
+    let problem = this.assess(parsed, root)
+    if (problem !== null) {
+      return problem
+    }
+    let resolved = this.view.realpath(parsed)
+    if (resolved === null || resolved.length === 0) {
+      return reject(parsed)
+    }
+    return resolved
+  }
+
+  release(opened: OpenedFile): void {
+    if (opened.fd < 0) {
+      return
+    }
+    try {
+      this.view.close(opened.fd)
+    } catch (err) {
+    }
+    opened.fd = -1
   }
 
   private assess(original: string, root: string): CenterError | null {
@@ -176,6 +216,51 @@ function segmentOk(root: string, target: string): boolean {
     return targetSeg.length === 0
   }
   return targetSeg.length === 0 || targetSeg === rootSeg
+}
+
+function normalizeAbsolute(path: string): string | null {
+  if (path.length === 0 || path.charAt(0) !== '/') {
+    return null
+  }
+  let parts: string[] = []
+  let buf = ''
+  for (let i = 0; i < path.length; i++) {
+    let ch = path.charAt(i)
+    if (ch === '/') {
+      if (!pushSegment(parts, buf)) {
+        return null
+      }
+      buf = ''
+    } else {
+      buf += ch
+    }
+  }
+  if (!pushSegment(parts, buf)) {
+    return null
+  }
+  if (parts.length === 0) {
+    return '/'
+  }
+  let out = ''
+  for (let i = 0; i < parts.length; i++) {
+    out += '/' + parts[i]
+  }
+  return out
+}
+
+function pushSegment(parts: string[], segment: string): boolean {
+  if (segment.length === 0 || segment === '.') {
+    return true
+  }
+  if (segment === '..') {
+    if (parts.length === 0) {
+      return false
+    }
+    parts.pop()
+    return true
+  }
+  parts.push(segment)
+  return true
 }
 
 function reject(raw: string): CenterError {

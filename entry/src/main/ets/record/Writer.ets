@@ -105,7 +105,6 @@ class SplitHits {
 
 export class Writer {
   private static files: CenterFiles | null = null
-  private static wait: Array<() => void> = []
   private static busy: boolean = false
 
   static bind(files: CenterFiles): void {
@@ -114,24 +113,14 @@ export class Writer {
 
   static exclusive<T>(work: () => T): T {
     if (Writer.busy) {
-      let boxed: T | null = null
-      Writer.wait.push(() => {
-        boxed = work()
-      })
-      return boxed as T
+      return work()
     }
     Writer.busy = true
-    let value = work()
-    Writer.busy = false
-    while (Writer.wait.length > 0) {
-      let next = Writer.wait.shift()
-      if (next !== undefined) {
-        Writer.busy = true
-        next()
-        Writer.busy = false
-      }
+    try {
+      return work()
+    } finally {
+      Writer.busy = false
     }
-    return value
   }
 
   static replaceText(path: string, text: string): void {
@@ -142,6 +131,7 @@ export class Writer {
 
   static readText(path: string): string | null {
     return Writer.exclusive(() => {
+      Writer.adopt(path)
       if (Writer.files === null) {
         return null
       }
@@ -196,17 +186,60 @@ export class Writer {
       return
     }
     let temp = path + '.tmp'
+    let bak = path + '.bak'
     Writer.files.write(temp, text)
-    if (Writer.files.read(path) !== null) {
-      Writer.files.remove(path)
+    let existed = Writer.files.read(path) !== null
+    if (existed) {
+      if (Writer.files.read(bak) !== null) {
+        Writer.files.remove(bak)
+      }
+      Writer.files.rename(path, bak)
     }
-    Writer.files.rename(temp, path)
+    try {
+      Writer.files.rename(temp, path)
+    } catch (err) {
+      if (Writer.files.read(path) === null && Writer.files.read(bak) !== null) {
+        Writer.files.rename(bak, path)
+      }
+      return
+    }
+    if (Writer.files.read(bak) !== null) {
+      Writer.files.remove(bak)
+    }
+  }
+
+  private static adopt(path: string): void {
+    if (Writer.files === null) {
+      return
+    }
+    let temp = path + '.tmp'
+    let bak = path + '.bak'
+    if (Writer.files.read(path) === null) {
+      if (Writer.files.read(temp) !== null) {
+        Writer.files.rename(temp, path)
+        if (Writer.files.read(bak) !== null) {
+          Writer.files.remove(bak)
+        }
+        return
+      }
+      if (Writer.files.read(bak) !== null) {
+        Writer.files.rename(bak, path)
+      }
+      return
+    }
+    if (Writer.files.read(bak) !== null) {
+      Writer.files.remove(bak)
+    }
+    if (Writer.files.read(temp) !== null) {
+      Writer.files.remove(temp)
+    }
   }
 
   private static recoverNow(): void {
     if (Writer.files === null) {
       return
     }
+    Writer.adopt(INDEX_PATH)
     let text = Writer.files.read(INDEX_PATH)
     if (text === null || text.length === 0) {
       return
@@ -235,6 +268,7 @@ export class Writer {
     if (Writer.files === null) {
       return []
     }
+    Writer.adopt(INDEX_PATH)
     let text = Writer.files.read(INDEX_PATH)
     if (text === null || text.length === 0) {
       return []

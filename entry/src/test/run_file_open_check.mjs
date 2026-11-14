@@ -18,7 +18,7 @@ const files = [
 function prep(source) {
   return source
     .replace(/import fs from '@ohos\.file\.fs';\n/,
-      "const fs = { openSync() { throw new Error('unused'); }, lstatSync() { throw new Error('unused'); }, closeSync() {}, OpenMode: { READ_ONLY: 0 } };\n")
+      "const fs = { openSync() { throw new Error('unused'); }, lstatSync(path) { if (String(path).indexOf('link') >= 0) { return { isSymbolicLink() { return true; } }; } throw new Error('missing'); }, closeSync() {}, OpenMode: { READ_ONLY: 0 } };\n")
     .replace(/import \{ hilog \} from '@kit\.PerformanceAnalysisKit';\n/g,
       "const hilog = { error() {}, info() {}, warn() {} };\n")
     .replaceAll("from '../../center/CenterLimits'", "from './CenterLimits.ts'")

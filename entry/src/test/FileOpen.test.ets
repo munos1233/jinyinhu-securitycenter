@@ -2,7 +2,7 @@ import { CenterError } from '../main/ets/center/CenterError'
 import type { FileGrant } from '../main/ets/center/CenterTypes'
 import { isHardExcluded, isPrivateDataPath, privateBundleSegment } from '../main/ets/feature/clean/Exclude'
 import type { FileView } from '../main/ets/system/FileOpen'
-import { FileOpen, OpenedFile } from '../main/ets/system/FileOpen'
+import { FileOpen, FsFileView, OpenedFile } from '../main/ets/system/FileOpen'
 
 class Grant implements FileGrant {
   uri: string = ''
@@ -193,5 +193,23 @@ export function runFileOpenChecks(): void {
   view.closed = []
   if (!opened(view, opener.open('file:///storage/users/a.txt', '/storage/users', false, none))) {
     fail('file uri 没有按路径检查')
+  }
+
+  let device = new FileOpen(new FsFileView())
+  let gone = device.accept('/storage/users/gone.txt', '/storage/users')
+  if (gone !== '/storage/users/gone.txt') {
+    fail('源文件已经不在时，恢复路径被拒绝了')
+  }
+  let folded = device.accept('/storage/users/../users/a.txt', '/storage/users')
+  if (folded !== '/storage/users/a.txt') {
+    fail('路径里的 .. 没有按目录折叠')
+  }
+  let link = device.accept('/storage/users/link', '/storage/users')
+  if (!(link instanceof CenterError) || link.code !== 'rejected-system-path') {
+    fail('符号链接在设备打开时被当成了普通文件')
+  }
+  let outside = device.accept('/storage/users/../../etc/passwd', '/storage/users')
+  if (!(outside instanceof CenterError)) {
+    fail('折出文件系统根的路径被允许了')
   }
 }

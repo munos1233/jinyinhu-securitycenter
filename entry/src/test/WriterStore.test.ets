@@ -309,7 +309,8 @@ export function runWriterStoreChecks(): void {
   Writer.bind(files)
   Writer.replaceText('center/jobs/a.txt', 'one')
   Writer.replaceText('center/jobs/a.txt', 'two')
-  if (files.read('center/jobs/a.txt') !== 'two' || files.read('center/jobs/a.txt.tmp') !== null) {
+  if (files.read('center/jobs/a.txt') !== 'two' || files.read('center/jobs/a.txt.tmp') !== null ||
+    files.read('center/jobs/a.txt.bak') !== null) {
     fail('连续替换丢了更新或留下了临时文件')
   }
 
@@ -706,6 +707,25 @@ export function runWriterStoreChecks(): void {
     protectText.indexOf('exam.protect.pure-mode') < 0) {
     fail('防护结果不是 ProtectFact[]')
   }
+
+  let nested = ''
+  Writer.exclusive(() => {
+    Writer.replaceText('center/jobs/nested.txt', 'in')
+    let text = Writer.readText('center/jobs/nested.txt')
+    nested = text === null ? '' : text
+  })
+  if (nested !== 'in' || files.read('center/jobs/nested.txt') !== 'in' ||
+    files.read('center/jobs/nested.txt.tmp') !== null || files.read('center/jobs/nested.txt.bak') !== null) {
+    fail('队列重入没有读到刚写下的内容')
+  }
+  let crash = new MemoryFiles()
+  Writer.bind(crash)
+  crash.write(INDEX + '.tmp', '[]')
+  Writer.recover()
+  if (crash.read(INDEX) !== '[]' || crash.read(INDEX + '.tmp') !== null || crash.read(INDEX + '.bak') !== null) {
+    fail('崩溃留下的临时索引没有成为正式索引')
+  }
+  Writer.bind(files)
 }
 
 class PermissionFilePeek {
