@@ -11,6 +11,8 @@ const files = [
   ['entry/src/main/ets/center/CenterLimits.ets', 'CenterLimits.ts'],
   ['entry/src/main/ets/center/Clock.ets', 'Clock.ts'],
   ['entry/src/main/ets/feature/exam/ExamState.ets', 'ExamState.ts'],
+  ['entry/src/main/ets/engine/Decide.ets', 'Decide.ts'],
+  ['entry/src/main/ets/engine/RulePack.ets', 'RulePack.ts'],
   ['entry/src/main/ets/record/Writer.ets', 'Writer.ts'],
   ['entry/src/main/ets/record/ResultStore.ets', 'ResultStore.ts'],
   ['entry/src/main/ets/record/CenterStore.ets', 'CenterStore.ts'],
@@ -28,6 +30,8 @@ function prep(source) {
     .replaceAll("from '../center/CenterTypes'", "from './CenterTypes.ts'")
     .replaceAll("from '../../center/CenterTypes'", "from './CenterTypes.ts'")
     .replaceAll("from '../feature/exam/ExamState'", "from './ExamState.ts'")
+    .replaceAll("from '../engine/RulePack'", "from './RulePack.ts'")
+    .replaceAll("from './Decide'", "from './Decide.ts'")
     .replaceAll("from '../main/ets/center/CenterLimits'", "from './CenterLimits.ts'")
     .replaceAll("from '../main/ets/center/CenterTypes'", "from './CenterTypes.ts'")
     .replaceAll("from '../main/ets/record/CenterStore'", "from './CenterStore.ts'")
