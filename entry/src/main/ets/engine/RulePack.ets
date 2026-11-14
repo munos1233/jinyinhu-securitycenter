@@ -35,6 +35,11 @@ export class HeuristicRule {
   level: string = 'suspicious'
 }
 
+export class RuleVersionOrder {
+  compared: boolean = false
+  order: number = 0
+}
+
 export class RuleLoad {
   rulesVersion: string = NONE
   versionComparable: boolean = false
@@ -84,6 +89,16 @@ export class RulePack {
     return parsed
   }
 
+  static compareVersions(local: string, cloud: string): RuleVersionOrder {
+    let result = new RuleVersionOrder()
+    if (!versionOk(local) || !versionOk(cloud)) {
+      return result
+    }
+    result.compared = true
+    result.order = compareUtf8(local, cloud)
+    return result
+  }
+
   private static parse(text: string | null): RuleLoad | null {
     if (text === null) {
       return null
@@ -113,6 +128,39 @@ function arrayOf(value: Object[] | undefined): Object[] {
     return value
   }
   return []
+}
+
+function compareUtf8(left: string, right: string): number {
+  let a = utf8(left)
+  let b = utf8(right)
+  let count = a.length < b.length ? a.length : b.length
+  for (let i = 0; i < count; i++) {
+    if (a[i] !== b[i]) {
+      return a[i] < b[i] ? -1 : 1
+    }
+  }
+  if (a.length === b.length) {
+    return 0
+  }
+  return a.length < b.length ? -1 : 1
+}
+
+function utf8(value: string): number[] {
+  let bytes: number[] = []
+  for (let i = 0; i < value.length; i++) {
+    let code = value.charCodeAt(i)
+    if (code < 0x80) {
+      bytes.push(code)
+    } else if (code < 0x800) {
+      bytes.push(0xc0 | (code >> 6))
+      bytes.push(0x80 | (code & 0x3f))
+    } else {
+      bytes.push(0xe0 | (code >> 12))
+      bytes.push(0x80 | ((code >> 6) & 0x3f))
+      bytes.push(0x80 | (code & 0x3f))
+    }
+  }
+  return bytes
 }
 
 function algoOk(value: string): boolean {
