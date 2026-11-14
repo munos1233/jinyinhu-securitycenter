@@ -1,3 +1,4 @@
+import { decisionFiles, prepareDecisionSource } from './decision_test_support.mjs'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -7,12 +8,15 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '../../..')
 const files = [
+  ...decisionFiles,
+  ['entry/src/main/ets/center/CenterTypes.ets', 'CenterTypes.ts'],
+  ['entry/src/main/ets/center/CenterLimits.ets', 'CenterLimits.ts'],
   ['entry/src/main/ets/engine/Decide.ets', 'Decide.ts'],
   ['entry/src/test/CanonicalCert.test.ets', 'CanonicalCert.test.ts']
 ]
 
 function prep(source) {
-  return source.replaceAll("from '../main/ets/engine/Decide'", "from './Decide.ts'")
+  return prepareDecisionSource(source).replaceAll("from '../main/ets/engine/Decide'", "from './Decide.ts'")
 }
 
 const dir = mkdtempSync(join(tmpdir(), 'canonical-cert-'))

@@ -1,3 +1,4 @@
+import { decisionFiles, prepareDecisionSource } from './decision_test_support.mjs'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -7,6 +8,7 @@ import { fileURLToPath } from 'node:url'
 const here = dirname(fileURLToPath(import.meta.url))
 const root = resolve(here, '../../..')
 const files = [
+  ...decisionFiles,
   ['entry/src/main/ets/center/CenterTypes.ets', 'CenterTypes.ts'],
   ['entry/src/main/ets/center/CenterLimits.ets', 'CenterLimits.ts'],
   ['entry/src/main/ets/center/Clock.ets', 'Clock.ts'],
@@ -19,7 +21,7 @@ const files = [
 ]
 
 function prep(source) {
-  return source
+  return prepareDecisionSource(source)
     .replace(/import fs from '@ohos\.file\.fs';\n/,
       "const fs = { openSync() { throw new Error('unused'); }, statSync() { return { size: 0 }; }, readSync() {}, writeSync() {}, closeSync() {}, renameSync() {}, unlinkSync() {}, mkdirSync() {} };\n")
     .replace(/import \{ hilog \} from '@kit\.PerformanceAnalysisKit';\n/g,
