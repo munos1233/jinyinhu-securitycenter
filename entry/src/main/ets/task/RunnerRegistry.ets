@@ -67,12 +67,13 @@ export class RunnerSet {
   clean: CleanRun | null = null
   duplicate: FileToolRun | null = null
   largeFile: FileToolRun | null = null
+  permission: PermissionRun | null = null
 }
 
 export class RunnerRegistry {
   private static current: RunnerTable = new RunnerTable()
 
-  /** EntryAbility 调用一次。本轮登记 exam、malware、clean、duplicate、large-file，其余种类仍是空的。 */
+  /** EntryAbility 调用一次。登记传入的 Runner，未提供的种类保持空。 */
   static registerAll(runners: RunnerSet = new RunnerSet()): void {
     let table = new RunnerTable()
     table.exam = runners.exam
@@ -80,6 +81,7 @@ export class RunnerRegistry {
     table.clean = runners.clean
     table.duplicate = runners.duplicate
     table.largeFile = runners.largeFile
+    table.permission = runners.permission
     RunnerRegistry.current = table
   }
 

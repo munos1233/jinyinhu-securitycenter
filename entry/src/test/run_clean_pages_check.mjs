@@ -116,7 +116,7 @@ if (routeMap === null) {
   if (!body.includes("route === 'P1' || route === 'P2' || route === 'P3'")) {
     problems.push('不重写 P1 P2 P3')
   }
-  for (const page of ['PermissionView', 'AppsView', 'ProtectView']) {
+  for (const page of ['AppsView', 'ProtectView']) {
     if (body.includes(page)) {
       problems.push(`本 issue 不换 ${page}`)
     }
@@ -126,8 +126,8 @@ if (routeMap === null) {
   }
 }
 const pending = indexCode.match(/PENDING_ROUTES: string\[\] = \[([^\]]*)\]/)
-if (pending === null || pending[1].replace(/\s/g, '') !== "'permission','apps','protect'") {
-  problems.push('只把 clean 和 quarantine 两个 builder 从占位换成真实页面')
+if (pending === null || pending[1].replace(/\s/g, '') !== "'apps','protect'") {
+  problems.push('软件和防护路由仍为占位')
 }
 
 if (problems.length > 0) {

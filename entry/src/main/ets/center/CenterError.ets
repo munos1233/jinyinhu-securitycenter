@@ -13,15 +13,14 @@ export type CenterErrorCode =
   | 'parse'
   | 'quota'
 
-export class CenterError {
+export class CenterError extends Error {
   code: CenterErrorCode
-  message: string
   raw: string
 
   constructor(code: CenterErrorCode, raw: string) {
+    super(centerErrorMessage(code))
     this.code = code
     this.raw = raw
-    this.message = centerErrorMessage(code)
   }
 }
 

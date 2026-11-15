@@ -191,6 +191,22 @@ export class AccessPort implements AccessFacts, GrantLookup, AccessRevoke {
     return out
   }
 
+  async canRevoke(tokenId: number, permission: string): Promise<boolean> {
+    if (!validToken(tokenId) || !this.ready() || this.gate.revoke().status !== 'ready') {
+      return false
+    }
+    try {
+      return !isFixed(await this.source.flagsOf(tokenId, permission))
+    } catch (err) {
+      let code = codeOf(err as Object)
+      hilog.warn(DOMAIN, TAG, 'access flags recheck failed: %{public}s', code)
+      if (REFUSED.indexOf(code) >= 0) {
+        this.refusal.refuse('grants', 'getPermissionFlags:' + code)
+      }
+      return false
+    }
+  }
+
   async revoke(tokenId: number, permission: string): Promise<void> {
     if (!validToken(tokenId)) {
       throw new CenterError('unsupported', 'token-unreadable')

@@ -8,17 +8,18 @@ import { HomeView } from './HomeView';
 import { JobResultView } from './JobResultView';
 import { LedgerView } from './LedgerView';
 import { MalwareView } from './MalwareView';
+import { PermissionView } from './PermissionView';
 import { QuarantineView } from './QuarantineView';
 import { ScanView } from './ScanView';
 import { SocView } from './SocView';
 
 /** 已有页面的路由。 */
 export const PAGE_ROUTES: string[] = [
-  'home', 'exam', 'malware', 'clean', 'quarantine', 'job', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about'
+  'home', 'exam', 'malware', 'clean', 'permission', 'quarantine', 'job', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about'
 ];
 /** 页面由后续 issue 落地，现在只有占位。 */
 export const PENDING_ROUTES: string[] = [
-  'permission', 'apps', 'protect'
+  'apps', 'protect'
 ];
 
 @Entry
@@ -93,6 +94,8 @@ struct Index {
         })
       } else if (route === 'quarantine') {
         QuarantineView()
+      } else if (route === 'permission') {
+        PermissionView({ params: routeParams(param) })
       } else if (PENDING_ROUTES.indexOf(route) >= 0) {
         pendingPage()
       }

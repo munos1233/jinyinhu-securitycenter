@@ -39,7 +39,7 @@ for (const path of [CLEAN, CORPSE, DUP, LARGE]) {
       problems.push(`${path} 出现了「${banned}」`)
     }
   }
-  if (/from '\.\.\/(exam|malware|permission|apps|protect)\//.test(text) || /from '\.\.\/\.\.\/pages\//.test(text)) {
+  if (/from '\.\.\/(exam|malware|apps|protect)\//.test(text) || /from '\.\.\/\.\.\/pages\//.test(text)) {
     problems.push(`${path}：功能模块互不 import，也不 import 页面`)
   }
 }
@@ -102,7 +102,7 @@ if (registerBody === null ||
   !/table\.clean = runners\.clean/.test(registerBody[1]) ||
   !/table\.duplicate = runners\.duplicate/.test(registerBody[1]) ||
   !/table\.largeFile = runners\.largeFile/.test(registerBody[1]) ||
-  /table\.(permission|apps|protect)\s*=/.test(registerBody[1])) {
+  /table\.(apps|protect)\s*=/.test(registerBody[1])) {
   problems.push('RunnerRegistry.registerAll 只追加 clean、duplicate、large-file')
 }
 
