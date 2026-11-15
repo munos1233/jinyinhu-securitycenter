@@ -77,8 +77,8 @@ if (/from '\.\.\/(feature|pages)\//.test(registry)) {
 }
 const registerBody = code(registry).match(/static registerAll\(.*\): void \{([\s\S]*?)\n {2}\}/)
 if (registerBody === null || !/table\.exam = runners\.exam/.test(registerBody[1]) ||
-  /table\.(clean|duplicate|largeFile|permission|apps|protect)\s*=/.test(registerBody[1])) {
-  problems.push('RunnerRegistry.registerAll 只登记 exam 和 malware')
+  /table\.(permission|apps|protect)\s*=/.test(registerBody[1])) {
+  problems.push('RunnerRegistry.registerAll 登记 exam，不登记 permission/apps/protect')
 }
 
 if (problems.length > 0) {
