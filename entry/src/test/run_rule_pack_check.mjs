@@ -1,3 +1,4 @@
+import { decisionFiles, prepareDecisionSource } from './decision_test_support.mjs'
 import { readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
@@ -19,6 +20,7 @@ if (sample.version !== '2026.11.12' || sample.files[0].sha256 !== '' ||
 }
 
 const files = [
+  ...decisionFiles,
   ['entry/src/main/ets/center/CenterTypes.ets', 'CenterTypes.ts'],
   ['entry/src/main/ets/center/CenterLimits.ets', 'CenterLimits.ts'],
   ['entry/src/main/ets/center/CenterError.ets', 'CenterError.ts'],
@@ -32,7 +34,7 @@ const files = [
 ]
 
 function prep(source) {
-  return source
+  return prepareDecisionSource(source)
     .replace(/import fs from '@ohos\.file\.fs';\n/,
       "const fs = { openSync() { throw new Error('unused'); }, statSync() { return { size: 0 }; }, readSync() {}, writeSync() {}, closeSync() {}, renameSync() {}, unlinkSync() {}, mkdirSync() {} };\n")
     .replace(/import \{ hilog \} from '@kit\.PerformanceAnalysisKit';\n/g,
