@@ -53,9 +53,11 @@ export interface GateProbes {
   huks(): Promise<Gate>
 }
 
+export type RefusableGate = 'grants' | 'revoke' | 'cacheStats' | 'clearCache' | 'persistFileGrant'
+
 /** 端口调用时被系统拒绝，把对应 Gate 记成 unsupported。下一次 probe() 重新探测。 */
 export interface GateRefusal {
-  refuse(id: 'grants' | 'revoke', reason: string): void
+  refuse(id: RefusableGate, reason: string): void
 }
 
 export class GateValue implements Gate {
@@ -189,12 +191,19 @@ export class ProbedGate implements SystemGate, GateRefusal {
     this.probedAt = -1
   }
 
-  refuse(id: 'grants' | 'revoke', reason: string): void {
+  refuse(id: RefusableGate, reason: string): void {
     hilog.warn(DOMAIN, TAG, 'gate %{public}s refused: %{public}s', id, reason)
+    let gate = gateOf(id, 'unsupported', reason)
     if (id === 'grants') {
-      this.current.grants = gateOf('grants', 'unsupported', reason)
+      this.current.grants = gate
+    } else if (id === 'revoke') {
+      this.current.revoke = gate
+    } else if (id === 'cacheStats') {
+      this.current.cacheStats = gate
+    } else if (id === 'clearCache') {
+      this.current.clearCache = gate
     } else {
-      this.current.revoke = gateOf('revoke', 'unsupported', reason)
+      this.current.persistFileGrant = gate
     }
   }
 
