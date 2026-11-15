@@ -2,6 +2,7 @@ import fs from '@ohos.file.fs';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { CenterError } from '../center/CenterError';
 import type { FileGrant } from '../center/CenterTypes';
+import type { InstallerOpen, OpenedInstaller } from '../engine/InstallerScan';
 import { isHardExcluded, isPrivateDataPath, privateBundleSegment } from '../feature/clean/Exclude';
 
 const DOMAIN: number = 0x4A59
@@ -14,7 +15,7 @@ export interface FileView {
   pathOf(fd: number): string | null
 }
 
-export class OpenedFile {
+export class OpenedFile implements OpenedInstaller {
   fd: number = -1
   path: string = ''
 }
@@ -28,15 +29,22 @@ export class FsFileView implements FileView {
     if (normal === null) {
       return null
     }
-    try {
-      let stat = fs.lstatSync(normal)
-      if (stat.isSymbolicLink()) {
-        return null
+    // SDK 没有 realpath/readlink 接口。逐层拒绝链接，避免祖先链接绕过授权边界。
+    let current = ''
+    for (let part of normal.split('/')) {
+      if (part.length === 0) {
+        continue
       }
-      return normal
-    } catch (err) {
-      return normal
+      current += '/' + part
+      try {
+        if (fs.lstatSync(current).isSymbolicLink()) {
+          return null
+        }
+      } catch (err) {
+        // 恢复目标可以尚不存在，后续仍由授权根与系统前缀检查约束。
+      }
     }
+    return normal
   }
 
   open(path: string): number | null {
@@ -72,7 +80,7 @@ export class FsFileView implements FileView {
   }
 }
 
-export class FileOpen {
+export class FileOpen implements InstallerOpen {
   private view: FileView
 
   constructor(view: FileView) {
@@ -140,7 +148,7 @@ export class FileOpen {
     return resolved
   }
 
-  release(opened: OpenedFile): void {
+  release(opened: OpenedInstaller): void {
     if (opened.fd < 0) {
       return
     }

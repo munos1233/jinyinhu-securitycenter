@@ -18,7 +18,7 @@ const files = [
 function prep(source) {
   return source
     .replace(/import fs from '@ohos\.file\.fs';\n/,
-      "const fs = { openSync() { throw new Error('unused'); }, lstatSync(path) { if (String(path).indexOf('link') >= 0) { return { isSymbolicLink() { return true; } }; } throw new Error('missing'); }, closeSync() {}, OpenMode: { READ_ONLY: 0 } };\n")
+      "const fs = { openSync() { throw new Error('unused'); }, lstatSync(path) { if (globalThis.__realFileStat) { return globalThis.__realFileStat(path); } if (path === '/storage/users/link') { return { isSymbolicLink() { return true; } }; } if (String(path).startsWith('/storage/users/link/')) { return { isSymbolicLink() { return false; } }; } throw new Error('missing'); }, closeSync() {}, OpenMode: { READ_ONLY: 0 } };\n")
     .replace(/import \{ hilog \} from '@kit\.PerformanceAnalysisKit';\n/g,
       "const hilog = { error() {}, info() {}, warn() {} };\n")
     .replaceAll("from '../../center/CenterLimits'", "from './CenterLimits.ts'")
@@ -39,7 +39,27 @@ try {
     writeFileSync(join(dir, to), prep(readFileSync(resolve(root, from), 'utf8')))
   }
   writeFileSync(join(dir, 'main.ts'),
-    "import { runFileOpenChecks } from './FileOpen.test.ts';\nrunFileOpenChecks();\n")
+    `import { runFileOpenChecks } from './FileOpen.test.ts';
+import { FileOpen, FsFileView } from './FileOpen.ts';
+import { CenterError } from './CenterError.ts';
+import { lstatSync, mkdirSync, symlinkSync } from 'node:fs';
+import { join } from 'node:path';
+runFileOpenChecks();
+const directory = ${JSON.stringify(join(dir, 'filesystem'))};
+mkdirSync(join(directory, 'storage/users'), { recursive: true });
+mkdirSync(join(directory, 'system/private/subdir'), { recursive: true });
+symlinkSync(join(directory, 'system/private'), join(directory, 'storage/users/link'),
+  process.platform === 'win32' ? 'junction' : 'dir');
+globalThis.__realFileStat = (path: string) => lstatSync(join(directory, path.substring(1)));
+const opener = new FileOpen(new FsFileView());
+const escaped = opener.accept('/storage/users/link/subdir/sample.hap', '/storage/users/link/subdir');
+if (!(escaped instanceof CenterError) || escaped.code !== 'rejected-system-path') {
+  throw new Error('真实文件系统中的祖先链接绕过了授权根');
+}
+if (opener.accept('/storage/users/new.hap', '/storage/users') !== '/storage/users/new.hap') {
+  throw new Error('普通授权目录中的恢复目标被错误拒绝');
+}
+`)
   const run = spawnSync(process.execPath, ['--experimental-strip-types', join(dir, 'main.ts')], {
     encoding: 'utf8'
   })
