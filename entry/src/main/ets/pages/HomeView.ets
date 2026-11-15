@@ -1,28 +1,85 @@
-import { common } from '@kit.AbilityKit';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Theme } from '../common/Theme';
 import { StatusLine } from '../components/UiParts';
+import type {
+  CheckItem,
+  ExamReport,
+  ExamState,
+  ExamSummary,
+  JobKind,
+  JobProgress,
+  JobRecord,
+  JobRequest,
+  JobState,
+  Lane,
+  ScanScope
+} from '../center/CenterTypes';
+import { homeExam } from '../feature/exam/ExamState';
+import type { HomeCandidate } from '../feature/exam/ExamState';
 import { LiveStore, ScanProgress } from '../model/LiveStore';
-import {
-  HomeSummary,
-  PROBE_IDS,
-  ProbeTone,
-  homeSummary,
-  probeName,
-  probeTone,
-  shortStamp,
-  toneLabel,
-  visibleRun
-} from '../model/ProbeStatus';
+import { PROBE_IDS, ProbeTone, probeName, probeTone, toneLabel, visibleRun } from '../model/ProbeStatus';
 import { ANOMALY_PHRASE, NO_ANOMALY_PHRASE, SYSTEM_REJECT_PHRASE } from '../probe/ProbeTypes';
-import { ScanTask } from '../model/ScanTask';
-import { DoppelUninstall } from './DoppelUninstall';
 import { ProbeShelf, emptyProbeShelf } from '../probe/ProbeTypes';
+import { ResultStore } from '../record/ResultStore';
+import { Writer } from '../record/Writer';
+import type { JobQueue } from '../task/JobQueue';
+import { DoppelUninstall } from './DoppelUninstall';
 import { Finding, Findings } from '../report/Findings';
 
 const DOMAIN = 0x4A59;
 const TAG = 'HomeView';
 const HERO_SIZE: number = 168;
+
+/** 组合根把 JobQueue 放在这个 AppStorage 键下。没有时首页不能开始体检。 */
+export const QUEUE_KEY: string = 'center.queue';
+export const NOT_RUN: string = '尚未体检';
+export const NOT_CHECKED: string = '尚未检测';
+const PROTECT_IDS: string[] = ['exam.protect.pure-mode', 'exam.protect.lockdown', 'exam.protect.el5'];
+const APPS_ID: string = 'exam.malware.apps';
+const OFFLINE: string = '未联网';
+const NO_CLOUD: string = '云端暂无结果';
+const UNCONFIRMED: string = '部分应用暂无法确认';
+
+export class HomeLook {
+  running: boolean = false;
+  /** 正在跑的体检，或首页采用的那份。点圆环进体检页用它。 */
+  openId: string = '';
+  state: ExamState = 'not-run';
+  headline: string = NOT_RUN;
+  notes: string[] = [];
+  numbers: string[] = [];
+  protect: string = NOT_CHECKED;
+  busy: string = '';
+  done: number = 0;
+  total: number = 0;
+}
+
+class IdleProgress implements JobProgress {
+  jobId: string = '';
+  kind: JobKind = 'exam';
+  lane: Lane = 'heavy';
+  state: JobState = 'done';
+  done: number = 0;
+  total: number = 0;
+  message: string = '';
+}
+
+class ExamRequest implements JobRequest {
+  kind: JobKind = 'exam';
+  scope: ScanScope = 'quick';
+  uris: string[] = [];
+  focus: string = '';
+}
+
+class Candidate implements HomeCandidate {
+  record: JobRecord;
+  report: ExamReport | null;
+
+  constructor(record: JobRecord, report: ExamReport | null) {
+    this.record = record;
+    this.report = report;
+  }
+}
 
 @Component
 export struct HomeView {
@@ -30,10 +87,19 @@ export struct HomeView {
   @StorageLink('findings') findings: Finding[] = [];
   @StorageLink('scanProgress') scanProgress: ScanProgress = new ScanProgress();
   @StorageLink('statusLine') statusLine: string = '';
-  @State starting: boolean = false;
-  onOpen: (route: string) => void = (route: string) => {
+  @StorageLink('center.job.heavy') @Watch('onHeavy') heavy: JobProgress = new IdleProgress();
+  @State look: HomeLook = new HomeLook();
+  onOpen: (route: string, params: string) => void = (route: string, params: string) => {
     hilog.info(DOMAIN, TAG, 'open %{public}s', route);
   };
+
+  aboutToAppear(): void {
+    this.reload();
+  }
+
+  onHeavy(): void {
+    this.reload();
+  }
 
   build() {
     Scroll() {
@@ -47,9 +113,11 @@ export struct HomeView {
 
         this.hero()
 
+        this.featureGrid()
+
         DoppelUninstall()
 
-        this.groupTitle('安全检测')
+        this.groupTitle('系统防护自检')
         Row() {
           ForEach(PROBE_IDS, (id: string) => {
             this.checkTile(id)
@@ -108,31 +176,49 @@ export struct HomeView {
           .borderRadius((HERO_SIZE - 56) / 2)
           .border({ width: 8, color: this.heroColor() })
           .backgroundColor(this.heroSoft())
-        if (this.scanning()) {
-          Progress({ value: this.progressValue(), total: 300, type: ProgressType.Ring })
+        if (this.look.running) {
+          Progress({ value: this.look.done, total: this.look.total > 0 ? this.look.total : 4, type: ProgressType.Ring })
             .width(HERO_SIZE)
             .height(HERO_SIZE)
             .style({ strokeWidth: 6 })
-            .color(this.heroColor())
+            .color(Theme.accent)
             .backgroundColor(Color.Transparent)
         }
       }
       .width(HERO_SIZE)
       .height(HERO_SIZE)
+      .onClick(() => {
+        this.openExam();
+      })
 
-      Text(this.headline())
+      Text(this.look.headline)
         .fontSize(22)
         .fontWeight(FontWeight.Medium)
-        .fontColor(this.scanning() ? Theme.text : this.heroColor())
+        .fontColor(this.look.running ? Theme.text : this.heroColor())
         .margin({ top: 20 })
-      Text(this.subline())
-        .fontSize(14)
-        .fontColor(Theme.muted)
-        .maxLines(1)
-        .textOverflow({ overflow: TextOverflow.Ellipsis })
-        .margin({ top: 6 })
 
-      Button(this.buttonLabel())
+      ForEach(this.look.notes, (note: string) => {
+        Text(note)
+          .fontSize(14)
+          .fontColor(Theme.muted)
+          .margin({ top: 6 })
+      }, (note: string) => note)
+
+      ForEach(this.look.numbers, (line: string) => {
+        Text(line)
+          .fontSize(14)
+          .fontColor(Theme.text)
+          .margin({ top: 6 })
+      }, (line: string) => line)
+
+      if (this.look.busy.length > 0) {
+        Text(this.look.busy)
+          .fontSize(13)
+          .fontColor(Theme.accent)
+          .margin({ top: 6 })
+      }
+
+      Button(this.look.running ? '体检中…' : '开始体检')
         .type(ButtonType.Capsule)
         .width(200)
         .height(40)
@@ -140,16 +226,94 @@ export struct HomeView {
         .fontWeight(FontWeight.Medium)
         .fontColor(Theme.onAccent)
         .backgroundColor(Theme.accent)
-        .enabled(!this.scanning())
-        .opacity(this.scanning() ? 0.4 : 1)
+        .enabled(!this.look.running)
+        .opacity(this.look.running ? 0.4 : 1)
         .margin({ top: 24 })
         .onClick(() => {
-          this.checkAll();
+          this.startExam();
         })
     }
     .width('100%')
     .alignItems(HorizontalAlign.Center)
     .padding({ top: 24, bottom: 16 })
+  }
+
+  @Builder
+  featureGrid() {
+    Column() {
+      Row() {
+        this.featureTile($r('sys.symbol.doc_text_badge_checkmark_fill'), '应用信誉', 'malware')
+        this.featureTile($r('sys.symbol.folder_fill'), '清理', 'clean')
+        this.featureTile($r('sys.symbol.hand_tap_fill'), '权限', 'permission')
+        this.featureTile($r('sys.symbol.phone_fill'), '软件', 'apps')
+      }
+      .width('100%')
+      .padding({ top: 8, bottom: 8 })
+
+      Divider()
+        .color(Theme.line)
+        .strokeWidth(0.5)
+        .margin({ left: 16, right: 16 })
+
+      Row() {
+        SymbolGlyph($r('sys.symbol.lock_shield_fill'))
+          .fontSize(22)
+          .fontColor([Theme.accent])
+        Text('防护')
+          .fontSize(16)
+          .fontColor(Theme.text)
+          .margin({ left: 12 })
+        Text(this.look.protect)
+          .layoutWeight(1)
+          .fontSize(13)
+          .fontColor(Theme.muted)
+          .textAlign(TextAlign.End)
+          .maxLines(1)
+          .textOverflow({ overflow: TextOverflow.Ellipsis })
+          .margin({ left: 12 })
+        SymbolGlyph($r('sys.symbol.chevron_right'))
+          .fontSize(18)
+          .fontColor([Theme.line])
+      }
+      .width('100%')
+      .height(56)
+      .padding({ left: 16, right: 16 })
+      .alignItems(VerticalAlign.Center)
+      .onClick(() => {
+        this.onOpen('protect', '');
+      })
+    }
+    .width('100%')
+    .borderRadius(20)
+    .backgroundColor(Theme.card)
+    .shadow({ radius: 24, color: '#0A141619', offsetY: 6 })
+  }
+
+  @Builder
+  featureTile(icon: Resource, title: string, route: string) {
+    Column() {
+      Stack() {
+        SymbolGlyph(icon)
+          .fontSize(26)
+          .fontColor([Theme.accent])
+      }
+      .width(48)
+      .height(48)
+      .borderRadius(12)
+      .backgroundColor(Theme.accentSoft)
+
+      Text(title)
+        .fontSize(14)
+        .fontColor(Theme.text)
+        .maxLines(1)
+        .margin({ top: 10 })
+    }
+    .layoutWeight(1)
+    .padding({ top: 12, bottom: 12 })
+    .alignItems(HorizontalAlign.Center)
+    .onClick(() => {
+      this.onOpen(route, '');
+    })
   }
 
   @Builder
@@ -199,7 +363,7 @@ export struct HomeView {
     .padding({ top: 12, bottom: 12 })
     .alignItems(HorizontalAlign.Center)
     .onClick(() => {
-      this.onOpen(id);
+      this.onOpen(id, '');
     })
   }
 
@@ -250,96 +414,58 @@ export struct HomeView {
     }
     .width('100%')
     .onClick(() => {
-      this.onOpen(route);
+      this.onOpen(route, '');
     })
   }
 
-  private summary(): HomeSummary {
-    return homeSummary(this.probeShelf);
+  private reload(): void {
+    this.look = homeLook(loadExamRows(), this.heavy);
   }
 
-  private scanning(): boolean {
-    return this.starting || this.scanProgress.running;
+  private startExam(): void {
+    if (this.look.running) {
+      return;
+    }
+    let queue = AppStorage.get<JobQueue>(QUEUE_KEY);
+    if (queue === undefined) {
+      hilog.error(DOMAIN, TAG, 'exam queue not ready');
+      LiveStore.setStatus('暂不支持');
+      return;
+    }
+    let jobId = queue.enqueue(examRequest());
+    this.reload();
+    if (jobId.length > 0) {
+      this.onOpen('exam', jobId);
+    }
   }
 
-  private headline(): string {
-    if (this.scanning()) {
-      return '正在体检';
+  private openExam(): void {
+    if (this.look.openId.length > 0) {
+      this.onOpen('exam', this.look.openId);
     }
-    let summary = this.summary();
-    if (summary.tone === 'risk') {
-      return '发现 ' + summary.risks.toString() + ' 项风险';
-    }
-    if (summary.tone === 'note') {
-      if (summary.notes === 1 && this.systemRejected()) {
-        return SYSTEM_REJECT_PHRASE;
-      }
-      return '有 ' + summary.notes.toString() + ' 项需要留意';
-    }
-    if (summary.tone === 'safe') {
-      return '万物有序 · 系统安然';
-    }
-    return '尚未体检';
-  }
-
-  private subline(): string {
-    if (this.scanning()) {
-      if (this.scanProgress.title.length === 0) {
-        return '准备检测';
-      }
-      if (this.scanProgress.total > 0 && this.scanProgress.step > 0) {
-        return this.scanProgress.title + '  ' + this.scanProgress.step.toString() + '/' + this.scanProgress.total.toString();
-      }
-      return this.scanProgress.title;
-    }
-    if (this.systemRejected()) {
-      return '更新包已被系统挡住';
-    }
-    let at = shortStamp(this.summary().lastAt);
-    if (at.length > 0) {
-      return '上次体检 ' + at;
-    }
-    return '检查安装包、应用隔离和安全控件';
-  }
-
-  private buttonLabel(): string {
-    if (this.scanning()) {
-      return '体检中…';
-    }
-    return this.summary().tone === 'none' ? '立即体检' : '重新体检';
   }
 
   private heroColor(): string {
-    return toneColor(this.summary().tone);
+    if (this.look.running) {
+      return Theme.accent;
+    }
+    return stateColor(this.look.state);
   }
 
   private heroSoft(): string {
-    if (this.scanning()) {
+    if (this.look.running) {
       return Theme.accentSoft;
     }
-    let tone = this.summary().tone;
-    if (tone === 'risk') {
+    if (this.look.state === 'risk') {
       return Theme.dangerSoft;
     }
-    if (tone === 'note') {
+    if (this.look.state === 'incomplete') {
       return Theme.warnSoft;
     }
-    if (tone === 'safe') {
+    if (this.look.state === 'clear') {
       return Theme.okSoft;
     }
     return Theme.accentSoft;
-  }
-
-  private progressValue(): number {
-    let index = PROBE_IDS.indexOf(this.scanProgress.probeId);
-    if (index < 0) {
-      return 0;
-    }
-    let part = 50;
-    if (this.scanProgress.total > 0 && this.scanProgress.step > 0) {
-      part = Math.round(this.scanProgress.step * 100 / this.scanProgress.total);
-    }
-    return index * 100 + part;
   }
 
   private tileText(id: string): string {
@@ -352,11 +478,6 @@ export struct HomeView {
       return run.phrase;
     }
     return toneLabel(probeTone(this.probeShelf, id));
-  }
-
-  private systemRejected(): boolean {
-    let run = visibleRun(this.probeShelf, 'P1');
-    return run !== undefined && run.phrase === SYSTEM_REJECT_PHRASE;
   }
 
   private tileTone(id: string): string {
@@ -381,33 +502,33 @@ export struct HomeView {
   private deviceHint(): string {
     return this.probeShelf.boardUdid.length > 0 ? '设备已登记' : '设备未登记';
   }
+}
 
-  private checkAll(): void {
-    if (this.scanning() || ScanTask.running()) {
-      return;
+function loadExamRows(): HomeCandidate[] {
+  let rows: HomeCandidate[] = [];
+  let records = Writer.loadIndex();
+  for (let i = 0; i < records.length; i++) {
+    if (records[i].kind !== 'exam') {
+      continue;
     }
-    let ctx = this.host();
-    if (ctx === undefined) {
-      LiveStore.setStatus('无法开始体检');
-      return;
-    }
-    this.starting = true;
-    ScanTask.run(ctx, []).then(() => {
-      this.starting = false;
-    }).catch((err: Object) => {
-      hilog.error(DOMAIN, TAG, 'check %{public}s', JSON.stringify(err));
-      LiveStore.setStatus('体检中断');
-      this.starting = false;
-    });
+    let settled = records[i].state !== 'queued' && records[i].state !== 'running';
+    let report = settled ? examReportOf(ResultStore.read(records[i].jobId)) : null;
+    rows.push(new Candidate(records[i], report));
   }
+  return rows;
+}
 
-  private host(): common.UIAbilityContext | undefined {
-    let value = this.getUIContext().getHostContext();
-    if (value === undefined) {
-      return undefined;
-    }
-    return value as common.UIAbilityContext;
+function stateColor(state: ExamState): string {
+  if (state === 'risk') {
+    return Theme.danger;
   }
+  if (state === 'incomplete') {
+    return Theme.warn;
+  }
+  if (state === 'clear') {
+    return Theme.ok;
+  }
+  return Theme.accent;
 }
 
 function toneColor(tone: ProbeTone): string {
@@ -431,4 +552,221 @@ function tileColor(id: string): string {
     return '#00A6A6';
   }
   return '#F7931E';
+}
+
+export function examRequest(): JobRequest {
+  return new ExamRequest();
+}
+
+/** 圆环只有四句，不带数字。 */
+export function ringText(state: ExamState): string {
+  if (state === 'risk') {
+    return '有风险';
+  }
+  if (state === 'incomplete') {
+    return '未完成';
+  }
+  if (state === 'clear') {
+    return '暂无风险';
+  }
+  return NOT_RUN;
+}
+
+/** 结果文件解析不成 ExamReport 时为 null，不当作空的通过。 */
+export function examReportOf(text: string | null): ExamReport | null {
+  if (text === null) {
+    return null;
+  }
+  let parsed: ExamReport;
+  try {
+    parsed = JSON.parse(text) as ExamReport;
+  } catch (err) {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    return null;
+  }
+  if (parsed.state !== 'not-run' && parsed.state !== 'risk' && parsed.state !== 'incomplete' &&
+    parsed.state !== 'clear') {
+    return null;
+  }
+  if (!(parsed.items instanceof Array) || !(parsed.apps instanceof Array) || parsed.summary === null ||
+    typeof parsed.summary !== 'object') {
+    return null;
+  }
+  let summary = parsed.summary;
+  summary.riskApps = typeof summary.riskApps === 'number' ? summary.riskApps : 0;
+  summary.suspiciousApps = typeof summary.suspiciousApps === 'number' ? summary.suspiciousApps : 0;
+  summary.cleanableBytes = typeof summary.cleanableBytes === 'number' ? summary.cleanableBytes : 0;
+  summary.cleanableKnown = summary.cleanableKnown === true;
+  summary.cleanableNote = typeof summary.cleanableNote === 'string' ? summary.cleanableNote : '';
+  summary.sensitiveApps = typeof summary.sensitiveApps === 'number' ? summary.sensitiveApps : 0;
+  summary.sensitiveKnown = summary.sensitiveKnown === true;
+  parsed.skipped = typeof parsed.skipped === 'number' ? parsed.skipped : 0;
+  parsed.advice = typeof parsed.advice === 'number' ? parsed.advice : 0;
+  return parsed;
+}
+
+function findItem(items: CheckItem[], id: string): CheckItem | null {
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].id === id) {
+      return items[i];
+    }
+  }
+  return null;
+}
+
+function hasText(text: string, part: string): boolean {
+  return text.indexOf(part) >= 0;
+}
+
+/** 第 8 节写在圆环下方的附加句。不改圆环。 */
+export function examNotes(report: ExamReport): string[] {
+  let notes: string[] = [];
+  let apps = findItem(report.items, APPS_ID);
+  if (report.state === 'clear') {
+    notes.push('本次只检查了已安装应用');
+    if (report.skipped > 0) {
+      notes.push('另有 ' + report.skipped.toString() + ' 项暂无法检查');
+    }
+    if (report.advice > 0) {
+      notes.push('有 ' + report.advice.toString() + ' 条建议');
+    }
+    if (report.summary.suspiciousApps > 0) {
+      notes.push('发现 ' + report.summary.suspiciousApps.toString() + ' 个可疑应用');
+    }
+    if (apps !== null && apps.status === 'ok' && hasText(apps.detail, OFFLINE)) {
+      notes.push('部分应用未联网，结果来自本地');
+    }
+    if (apps !== null && apps.status === 'ok' && hasText(apps.detail, NO_CLOUD)) {
+      notes.push('部分应用云端暂无结果');
+    }
+  }
+  if (apps !== null && hasText(apps.detail, UNCONFIRMED)) {
+    notes.push(UNCONFIRMED);
+  }
+  return notes;
+}
+
+export function formatBytes(bytes: number): string {
+  let units: string[] = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = bytes > 0 ? bytes : 0;
+  let unit = 0;
+  while (value >= 1024 && unit < units.length - 1) {
+    value = value / 1024;
+    unit++;
+  }
+  if (unit === 0) {
+    return Math.round(value).toString() + ' B';
+  }
+  return (Math.round(value * 10) / 10).toString() + ' ' + units[unit];
+}
+
+/** 圆环之外的三句数字。标志为 false 的那句不出现，不显示 0。 */
+export function summaryLines(summary: ExamSummary): string[] {
+  let lines: string[] = [];
+  lines.push('风险应用 ' + summary.riskApps.toString() + ' 个');
+  if (summary.cleanableKnown) {
+    let line = '可清理 ' + formatBytes(summary.cleanableBytes);
+    if (summary.cleanableNote.length > 0) {
+      line += '，' + summary.cleanableNote;
+    }
+    lines.push(line);
+  }
+  if (summary.sensitiveKnown) {
+    lines.push(summary.sensitiveApps.toString() + ' 个应用持有敏感权限');
+  }
+  return lines;
+}
+
+/** 第五行只读这份体检里的纯净模式、lockdown、el5。 */
+export function protectLine(items: CheckItem[]): string {
+  let ok = 0;
+  let risk = 0;
+  let other = 0;
+  let seen = 0;
+  for (let i = 0; i < PROTECT_IDS.length; i++) {
+    let item = findItem(items, PROTECT_IDS[i]);
+    if (item === null) {
+      continue;
+    }
+    seen++;
+    if (item.status === 'ok') {
+      ok++;
+    } else if (item.status === 'risk') {
+      risk++;
+    } else {
+      other++;
+    }
+  }
+  if (seen === 0) {
+    return NOT_CHECKED;
+  }
+  return '正常 ' + ok.toString() + ' · 有风险 ' + risk.toString() + ' · 暂不支持 ' + other.toString();
+}
+
+function active(state: JobState): boolean {
+  return state === 'queued' || state === 'running';
+}
+
+function runningExamId(rows: HomeCandidate[], heavy: JobProgress): string {
+  if (heavy.kind === 'exam' && heavy.jobId.length > 0 && active(heavy.state)) {
+    return heavy.jobId;
+  }
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].record.kind === 'exam' && active(rows[i].record.state)) {
+      return rows[i].record.jobId;
+    }
+  }
+  return '';
+}
+
+function reportOf(rows: HomeCandidate[], jobId: string): ExamReport | null {
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i].record.jobId === jobId) {
+      return rows[i].report;
+    }
+  }
+  return null;
+}
+
+/**
+ * 首页顶部。体检在 queued 或 running 时只显示这条作业的 message。
+ * 否则圆环、附加句、三句数字和第五行都来自 homeExam() 采用的同一份。
+ */
+export function homeLook(rows: HomeCandidate[], heavy: JobProgress): HomeLook {
+  let look = new HomeLook();
+  let running = runningExamId(rows, heavy);
+  if (running.length > 0) {
+    look.running = true;
+    look.openId = running;
+    look.headline = heavy.jobId === running ? heavy.message : '';
+    look.done = heavy.jobId === running ? heavy.done : 0;
+    look.total = heavy.jobId === running ? heavy.total : 0;
+    return look;
+  }
+  if (heavy.kind !== 'exam' && heavy.jobId.length > 0 && active(heavy.state)) {
+    look.busy = heavy.message;
+  }
+  let picked = homeExam(rows);
+  if (picked.jobId.length === 0) {
+    return look;
+  }
+  let report = reportOf(rows, picked.jobId);
+  if (report === null) {
+    return look;
+  }
+  look.openId = picked.jobId;
+  look.state = report.state;
+  look.headline = ringText(report.state);
+  if (picked.banner.length > 0) {
+    look.notes.push(picked.banner);
+  }
+  let extra = examNotes(report);
+  for (let i = 0; i < extra.length; i++) {
+    look.notes.push(extra[i]);
+  }
+  look.numbers = summaryLines(report.summary);
+  look.protect = protectLine(report.items);
+  return look;
 }
