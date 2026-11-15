@@ -19,6 +19,10 @@
     {
       "name": "perm_install_reason",
       "value": "卸载已被伪造包替换的笔记"
+    },
+    {
+      "name": "perm_bundle_list_reason",
+      "value": "列出已安装应用，核对来源与权限"
     }
   ]
 }
