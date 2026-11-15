@@ -117,8 +117,8 @@ if (routeMap === null) {
     problems.push('不重写 P1 P2 P3')
   }
   for (const page of ['AppsView', 'ProtectView']) {
-    if (body.includes(page)) {
-      problems.push(`本 issue 不换 ${page}`)
+    if (!body.includes(page)) {
+      problems.push(`页面路由缺少 ${page}`)
     }
   }
   if (!/PENDING_ROUTES\.indexOf\(route\) >= 0\)\s*\{\s*pendingPage\(\)/.test(body)) {
@@ -126,8 +126,8 @@ if (routeMap === null) {
   }
 }
 const pending = indexCode.match(/PENDING_ROUTES: string\[\] = \[([^\]]*)\]/)
-if (pending === null || pending[1].replace(/\s/g, '') !== "'apps','protect'") {
-  problems.push('软件和防护路由仍为占位')
+if (pending === null || pending[1].replace(/\s/g, '') !== '') {
+  problems.push('软件和防护路由应为真实页面')
 }
 
 if (problems.length > 0) {

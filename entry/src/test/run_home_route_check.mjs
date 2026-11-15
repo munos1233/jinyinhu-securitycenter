@@ -37,8 +37,8 @@ if (!/PENDING_ROUTES\.indexOf\(route\) >= 0\)\s*\{\s*pendingPage\(\)/.test(index
   problems.push('占位路由只放占位 builder')
 }
 for (const page of ['AppsView', 'ProtectView']) {
-  if (existsSync(resolve(root, `entry/src/main/ets/pages/${page}.ets`)) || indexCode.includes(page)) {
-    problems.push(`本 issue 不新建 ${page}`)
+  if (!existsSync(resolve(root, `entry/src/main/ets/pages/${page}.ets`)) || !indexCode.includes(page)) {
+    problems.push(`页面路由缺少 ${page}`)
   }
 }
 if (!/onOpen: \(route: string, params: string\) => void/.test(homeCode) ||
