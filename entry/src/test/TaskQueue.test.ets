@@ -587,6 +587,120 @@ async function failureRules(): Promise<void> {
   require(h.row(protect).state === 'failed' && h.row(protect).summary === '暂不支持', '没有 Runner 时 failed，写暂不支持')
 }
 
+interface ExamPeek {
+  state: string
+  appsComplete: boolean
+  summary: Record<string, number>
+  items: Record<string, string>[]
+}
+
+function examBody(jobId: string, appsLevel: string, appLevels: string[], appsComplete: boolean): Object {
+  let items: Object[] = [
+    { id: 'exam.protect.pure-mode', title: '纯净模式', group: 'protect', status: 'ok', kind: 'state',
+      source: 'system', detail: '', action: { route: 'protect', params: '' }, countsTowardState: true }
+  ]
+  if (appsLevel.length > 0) {
+    items.push({ id: 'exam.malware.apps', title: '应用信誉', group: 'threat', status: appsLevel, kind: 'state',
+      source: 'local-rule', detail: '', action: { route: 'malware', params: jobId }, countsTowardState: true })
+  }
+  let apps: Object[] = []
+  for (let i = 0; i < appLevels.length; i++) {
+    apps.push({ displayName: 'app' + i, quarantined: false, action: 'none', granted: [],
+      verdict: { level: appLevels[i], source: 'local-rule', reason: '', evidence: '', cloud: 'reached' } })
+  }
+  return {
+    jobId: jobId, state: 'clear', items: items, apps: apps, appsComplete: appsComplete,
+    summary: { riskApps: 0, suspiciousApps: 0, unknownApps: 0, okApps: 0, parts: [], cleanableBytes: 0,
+      cleanableKnown: false, cleanableNote: '', sensitiveApps: 0, sensitiveKnown: false, anomalyApps: 0 },
+    skipped: 0, advice: 0, generatedAt: ''
+  } as Object
+}
+
+function peekExam(h: Harness, jobId: string): ExamPeek {
+  let text = h.files.read('center/jobs/' + jobId + '.json')
+  if (text === null) {
+    throw new Error('no exam result for ' + jobId)
+  }
+  return JSON.parse(text) as ExamPeek
+}
+
+async function settleStoppedExams(): Promise<void> {
+  let cancel = new Harness('')
+  let entered = new Latch()
+  let hold = new Latch()
+  cancel.table.exam = async (ctx, hand) => {
+    hand.save(examBody(ctx.base.job.jobId, 'ok', ['ok', 'ok'], true))
+    ctx.base.report(2, 4, '正在计算可清理空间')
+    entered.open()
+    await hold.promise
+    return end(2, '')
+  }
+  let cid = cancel.queue.enqueue(request('exam', 'quick', [], ''))
+  await entered.promise
+  cancel.queue.cancel(cid)
+  hold.open()
+  await until(() => cancel.row(cid).state === 'cancelled', '体检取消')
+  let afterCancel = peekExam(cancel, cid)
+  let cancelApps = afterCancel.items[1]
+  require(cancel.row(cid).state === 'cancelled', '收口后作业状态保持 cancelled')
+  require(afterCancel.summary.okApps === 2, 'cancel 之后调用 settleStoppedExam')
+  require(afterCancel.appsComplete && cancelApps.detail.indexOf('本次扫描未完成') < 0 && cancelApps.status === 'ok',
+    '应用循环写完后在统计缓存阶段取消，详情不含本次扫描未完成：' + cancelApps.detail)
+  require(afterCancel.state === 'clear', '没有风险和未知时圆环不是未完成')
+
+  let early = new Harness('')
+  early.table.exam = async (ctx, hand) => {
+    hand.save(examBody(ctx.base.job.jobId, '', [], false))
+    throw new Error('boom')
+  }
+  let eid = early.queue.enqueue(request('exam', 'quick', [], ''))
+  await until(() => terminal(early.row(eid).state), '体检抛错')
+  let afterThrow = peekExam(early, eid)
+  require(early.row(eid).state === 'failed', 'Runner 抛错时作业保持 failed')
+  require(afterThrow.state === 'incomplete', '只写了姿态 ok 的半成品收口后不是 clear：' + afterThrow.state)
+
+  let down = new Harness('')
+  down.table.exam = async (ctx, hand) => {
+    hand.save(examBody(ctx.base.job.jobId, 'ok', ['risk', 'suspicious'], false))
+    throw new CenterError('io', 'hash-worker:spawn')
+  }
+  let did = down.queue.enqueue(request('exam', 'quick', [], ''))
+  await until(() => terminal(down.row(did).state), 'Worker 起不来')
+  let afterDown = peekExam(down, did)
+  require(down.row(did).state === 'failed' && down.row(did).summary === '文件处理失败',
+    'Worker 起不来时体检记 failed，原因走 io')
+  require(afterDown.state === 'risk' && afterDown.summary.riskApps === 1 && afterDown.items[1].status === 'risk',
+    'Worker 起不来时同样收口，apps[] 已有风险时 state 是 risk')
+  require(afterDown.items.length === 3 && afterDown.items[2].id === 'exam.malware.suspicious',
+    '收口时补上可疑应用项')
+  require(!afterDown.appsComplete, 'appsComplete 为 false 时保持 false')
+
+  let bare = new Harness('')
+  bare.table.exam = async (ctx, hand) => {
+    throw new Error('before save')
+  }
+  let bid = bare.queue.enqueue(request('exam', 'quick', [], ''))
+  await until(() => terminal(bare.row(bid).state), '没有结果文件的体检抛错')
+  require(bare.row(bid).state === 'failed' && bare.files.read('center/jobs/' + bid + '.json') === null,
+    '没有结果文件时不合成 clear')
+
+  let other = new Harness('')
+  other.table.exam = async (ctx, hand) => {
+    hand.save(examBody(ctx.base.job.jobId, 'ok', ['risk'], true))
+    return end(1, '')
+  }
+  let first = other.queue.enqueue(request('exam', 'quick', [], ''))
+  await until(() => other.row(first).state === 'done', '第一份体检 done')
+  let firstText = other.files.read('center/jobs/' + first + '.json')
+  other.table.exam = async (ctx, hand) => {
+    hand.save(examBody(ctx.base.job.jobId, '', [], false))
+    throw new Error('boom')
+  }
+  let second = other.queue.enqueue(request('exam', 'quick', [], ''))
+  await until(() => terminal(other.row(second).state), '第二份体检抛错')
+  require(other.files.read('center/jobs/' + first + '.json') === firstText, '不改另一条已经 done 的体检')
+}
+
 async function reportOnUiThread(): Promise<void> {
   let h = new Harness('')
   let reported = new Latch()
@@ -698,5 +812,6 @@ export async function runTaskQueueChecks(): Promise<void> {
   await gateAndWriter()
   await cancelRules()
   await failureRules()
+  await settleStoppedExams()
   await reportOnUiThread()
 }

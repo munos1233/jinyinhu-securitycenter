@@ -275,6 +275,9 @@ export class JobQueue {
     job.record.finishedAt = this.clock.nowIso()
     job.message = end.summary
     this.store(job.record)
+    if (end.state === 'cancelled') {
+      Writer.settleExam(job.record)
+    }
     this.publish(job)
   }
 

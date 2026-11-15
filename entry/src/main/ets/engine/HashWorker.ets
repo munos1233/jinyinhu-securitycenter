@@ -5,7 +5,10 @@ import { CryptoDigest, FsHashIo, hashFd, HashResult } from './Hash'
 
 const DOMAIN: number = 0x4A59
 const TAG: string = 'Center'
-/** CenterError.raw 的前缀。带这个前缀的 io 让整次作业 failed，其余 io 只让该条失败。 */
+/**
+ * CenterError.raw 的前缀。带这个前缀的 io 让整次作业 failed，其余 io 只让该条失败。
+ * Runner 不得吞掉它：该次是体检时，JobRunner 要靠它记 failed 并收口已写下的结果。
+ */
 export const WORKER_DOWN: string = 'hash-worker:'
 
 @Concurrent
@@ -33,7 +36,7 @@ export class HashWorker {
   }
 
   /**
-   * Worker 起不来时抛 raw 以 WORKER_DOWN 开头的 io，不退回 UI 线程哈希。
+   * Worker 起不来时抛 raw 以 WORKER_DOWN 开头的 io，不退回 UI 线程哈希，也不返回空结果。
    * 单个文件读失败抛普通 io。取消时返回 cancelled=true，sha256 为空串。
    */
   async hash(fd: number, cancel: SharedArrayBuffer): Promise<HashResult> {
