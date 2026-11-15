@@ -1,4 +1,4 @@
-import { createHash, generateKeyPairSync, sign, X509Certificate } from 'node:crypto'
+import { createHash, createPublicKey, generateKeyPairSync, sign, verify, constants as cryptoConstants, X509Certificate } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -35,37 +35,62 @@ function integer(number) {
   return value(2, bytes[0] & 128 ? Buffer.concat([Buffer.from([0]), bytes]) : bytes)
 }
 
-function certificate(commonName, serial) {
-  const keys = generateKeyPairSync('ec', { namedCurve: 'prime256v1' })
+function certificate(commonName, serial, { family = 'ECC', namedCurve = 'prime256v1',
+  modulusLength = 2048, digestName = 'sha256' } = {}) {
+  const keys = family === 'ECC'
+    ? generateKeyPairSync('ec', { namedCurve })
+    : generateKeyPairSync('rsa', { modulusLength })
   const name = sequence(set(sequence(oid('550403'), value(12, Buffer.from(commonName)))))
-  const algorithm = sequence(oid('2a8648ce3d040302'))
+  const algorithm = sequence(oid(signatureOid(family, digestName)))
   const publicKey = keys.publicKey.export({ type: 'spki', format: 'der' })
   const ski = createHash('sha1').update(publicKey).digest()
   const tbs = sequence(value(0xa0, integer(2)), integer(serial), algorithm, name,
     sequence(value(23, Buffer.from('260101000000Z')), value(23, Buffer.from('460101000000Z'))),
     name, publicKey, value(0xa3, sequence(sequence(oid('551d0e'), value(4, value(4, ski))))))
-  const der = sequence(tbs, algorithm, value(3, Buffer.from([0]), sign('sha256', tbs, keys.privateKey)))
+  const der = sequence(tbs, algorithm, value(3, Buffer.from([0]), sign(digestName, tbs, keys.privateKey)))
   new X509Certificate(der)
-  return { keys, name, serial, ski, der }
+  return { keys, name, serial, ski, der, family }
+}
+
+function digestIndex(digestName) {
+  const index = ['sha256', 'sha384', 'sha512'].indexOf(digestName)
+  if (index < 0) throw new Error(`unsupported fixture digest ${digestName}`)
+  return index
+}
+
+function signatureOid(family, digestName) {
+  return family === 'ECC'
+    ? ['2a8648ce3d040302', '2a8648ce3d040303', '2a8648ce3d040304'][digestIndex(digestName)]
+    : ['2a864886f70d01010b', '2a864886f70d01010c', '2a864886f70d01010d'][digestIndex(digestName)]
 }
 
 const signer = certificate('HAP fixture signer', 42)
 const other = certificate('Other certificate first', 43)
 const certificateHash = createHash('sha256').update(signer.der).digest('hex')
 
-function cms({ ski = false, ber = false, wrongSigner = false } = {}) {
+function cms({ ski = false, ber = false, wrongSigner = false, attributes = false, wrongAttrDigest = false, wrongContentType = false, multipleSigners = false, identity = signer, digestName = 'sha256' } = {}, content = null) {
+  const template = content === null
+  content ??= Buffer.from('Unbound payload')
   const constructed = (tag, ...parts) => ber
     ? Buffer.concat([Buffer.from([tag, 0x80]), ...parts, Buffer.from([0, 0])])
     : value(tag, ...parts)
-  const content = Buffer.from('HAP fixture signed payload')
-  const digest = sequence(oid('608648016503040201'))
-  const sid = ski ? value(0x80, signer.ski) : sequence(signer.name, integer(wrongSigner ? 99 : signer.serial))
-  const info = sequence(integer(ski ? 3 : 1), sid, digest, sequence(oid('2a8648ce3d040302')),
-    value(4, sign('sha256', content, signer.keys.privateKey)))
+  const digest = sequence(oid(['608648016503040201', '608648016503040202',
+    '608648016503040203'][digestIndex(digestName)]))
+  const sid = ski ? value(0x80, identity.ski) : sequence(identity.name, integer(wrongSigner ? 99 : identity.serial))
+  const attrs = [
+    sequence(oid('2a864886f70d010903'), set(oid(wrongContentType ? '2a864886f70d010702' : '2a864886f70d010701'))),
+    sequence(oid('2a864886f70d010904'), set(value(4, createHash(digestName).update(wrongAttrDigest ? Buffer.from('wrong digest') : content).digest())))
+  ].sort(Buffer.compare)
+  const signedContent = attributes ? set(...attrs) : content
+  const info = sequence(integer(ski ? 3 : 1), sid, digest,
+    ...(attributes ? [value(0xa0, ...attrs)] : []), sequence(oid(signatureOid(identity.family, digestName))),
+    value(4, sign(digestName, signedContent, identity.keys.privateKey)))
   const signedData = constructed(0x30, integer(ski ? 3 : 1), set(digest),
     sequence(oid('2a864886f70d010701'), value(0xa0, value(4, content))),
-    constructed(0xa0, other.der, signer.der), set(info))
-  return constructed(0x30, oid('2a864886f70d010702'), constructed(0xa0, signedData))
+    constructed(0xa0, other.der, identity.der), set(...(multipleSigners ? [info, info] : [info])))
+  const bytes = constructed(0x30, oid('2a864886f70d010702'), constructed(0xa0, signedData))
+  if (template) bytes.hapTemplate = { ski, ber, wrongSigner, attributes, wrongAttrDigest, wrongContentType, multipleSigners, identity, digestName }
+  return bytes
 }
 
 function crc32(bytes) {
@@ -131,16 +156,46 @@ function zip(entries, { blocks = [signature()], version = 3, comment = '' } = {}
     central.push(header, name)
     offset += local.length + name.length + compressed.length
   }
-  const block = signingBlock(blocks, version)
   const directory = Buffer.concat(central)
   const ending = Buffer.alloc(22)
   ending.writeUInt32LE(0x06054b50, 0)
   ending.writeUInt16LE(entries.length, 8)
   ending.writeUInt16LE(entries.length, 10)
   ending.writeUInt32LE(directory.length, 12)
-  ending.writeUInt32LE(offset + block.length, 16)
+  ending.writeUInt32LE(offset, 16)
   ending.writeUInt16LE(Buffer.byteLength(comment), 20)
-  return Buffer.concat([...locals, block, directory, ending, Buffer.from(comment)])
+  const commentBytes = Buffer.from(comment)
+  const signatureTemplate = blocks.find(item => item.type === 0x20000000 && item.data.hapTemplate)?.data.hapTemplate
+  const digestName = signatureTemplate?.digestName ?? 'sha256'
+  const digestLength = [32, 48, 64][digestIndex(digestName)]
+  const digestAlgorithm = ((signatureTemplate?.identity.family ?? 'ECC') === 'ECC' ? 0x201 : 0x104) + digestIndex(digestName)
+  const chunks = []
+  for (const section of [Buffer.concat(locals), directory, Buffer.concat([ending, commentBytes])]) {
+    for (let at = 0; at < section.length; at += 1024 * 1024) {
+      const part = section.subarray(at, at + 1024 * 1024)
+      const prefix = Buffer.alloc(5)
+      prefix[0] = 0xa5
+      prefix.writeUInt32LE(part.length, 1)
+      chunks.push(createHash(digestName).update(prefix).update(part).digest())
+    }
+  }
+  const prefix = Buffer.alloc(5)
+  prefix[0] = 0x5a
+  prefix.writeUInt32LE(chunks.length, 1)
+  const hash = createHash(digestName).update(prefix).update(Buffer.concat(chunks))
+  for (const item of blocks) if (item.type !== 0x20000000) hash.update(item.data)
+  const content = Buffer.alloc(20 + digestLength)
+  content.writeUInt32LE(2, 0)
+  content.writeUInt32LE(1, 4)
+  content.writeUInt32LE(8 + digestLength, 8)
+  content.writeUInt32LE(digestAlgorithm, 12)
+  content.writeUInt32LE(digestLength, 16)
+  hash.digest().copy(content, 20)
+  const bound = blocks.map(item => ({ type: item.type,
+    data: item.data.hapTemplate ? cms(item.data.hapTemplate, content) : item.data }))
+  const block = signingBlock(bound, version)
+  ending.writeUInt32LE(offset + block.length, 16)
+  return Buffer.concat([...locals, block, directory, ending, commentBytes])
 }
 
 function configuration(bundleName = 'com.test.fixture', padding = '') {
@@ -171,11 +226,13 @@ const files = [
   ['entry/src/main/ets/center/CenterLimits.ets', 'CenterLimits.ts'],
   ['entry/src/main/ets/center/CenterError.ets', 'CenterError.ts'],
   ['entry/src/main/ets/engine/Decide.ets', 'Decide.ts'],
+  ['entry/src/main/ets/engine/RulePack.ets', 'RulePack.ts'],
   ['entry/src/main/ets/engine/LocalRuleEngine.ets', 'LocalRuleEngine.ts'],
   ['entry/src/main/ets/engine/Lookalike.ets', 'Lookalike.ts'],
   ['entry/src/main/ets/engine/Heuristic.ets', 'Heuristic.ts'],
   ['entry/src/main/ets/engine/BundleFinger.ets', 'BundleFinger.ts'],
   ['entry/src/main/ets/engine/HapReader.ets', 'HapReader.ts'],
+  ['entry/src/main/ets/engine/HapSignature.ets', 'HapSignature.ts'],
   ['entry/src/main/ets/engine/InstallerScan.ets', 'InstallerScan.ts'],
   ['entry/src/main/ets/feature/clean/Exclude.ets', 'Exclude.ts'],
   ['entry/src/main/ets/system/FileOpen.ets', 'FileOpen.ts'],
@@ -186,6 +243,58 @@ try {
   mkdirSync(join(directory, 'fixtures'))
   mkdirSync(join(directory, 'installers'))
   const ordinary = [{ name: 'module.json', data: configuration() }]
+  const signed = zip(ordinary)
+  // Mutate the actual CMS signature of a HAP whose content digest is valid.
+  const tamperedSignature = Buffer.from(signed)
+  const centralOffset = signed.readUInt32LE(signed.length - 6)
+  tamperedSignature[centralOffset - 33] ^= 1
+  fixture('tampered-signature', tamperedSignature, { cert: '' })
+  const tamperedContent = Buffer.from(signed)
+  tamperedContent[0x05] ^= 1 // local-header bytes not interpreted as configuration
+  fixture('tampered-content', tamperedContent, { cert: '' })
+  const unboundCms = Buffer.from(cms())
+  fixture('unbound-cms', zip(ordinary, { blocks: [signature(unboundCms)] }), { cert: '' })
+  fixture('signed-attributes', zip(ordinary, { blocks: [signature(cms({ attributes: true }))] }))
+  fixture('wrong-attribute-digest', zip(ordinary, { blocks: [signature(cms({ attributes: true,
+    wrongAttrDigest: true }))] }), { cert: '' })
+  fixture('wrong-content-type', zip(ordinary, { blocks: [signature(cms({ attributes: true,
+    wrongContentType: true }))] }), { cert: '' })
+  fixture('multiple-signers', zip(ordinary, { blocks: [signature(cms({ multipleSigners: true }))] }), { cert: '' })
+  fixture('wide-asn-container', zip(ordinary, { blocks: [signature(sequence(...Array.from({ length: 4097 }, () => value(5))))] }), { cert: '' })
+
+  const algorithmCases = [
+    { name: 'ecc256-sha256', family: 'ECC', namedCurve: 'prime256v1', digestName: 'sha256' },
+    { name: 'ecc384-sha384', family: 'ECC', namedCurve: 'secp384r1', digestName: 'sha384' },
+    { name: 'ecc521-sha512', family: 'ECC', namedCurve: 'secp521r1', digestName: 'sha512' },
+    { name: 'rsa2048-sha256', family: 'RSA', modulusLength: 2048, digestName: 'sha256' },
+    { name: 'rsa3072-sha384', family: 'RSA', modulusLength: 3072, digestName: 'sha384' },
+    { name: 'rsa4096-sha512', family: 'RSA', modulusLength: 4096, digestName: 'sha512' }
+  ]
+  for (const [index, test] of algorithmCases.entries()) {
+    const identity = certificate(`HAP ${test.name}`, 100 + index, test)
+    const cert = createHash('sha256').update(identity.der).digest('hex')
+    const bytes = zip([{ name: 'module.json', data: configuration('com.algorithm.fixture') }], {
+      blocks: [signature(cms({ identity, digestName: test.digestName, attributes: true }))]
+    })
+    fixture(test.name, bytes, { packageName: 'com.algorithm.fixture', cert })
+    const badSignature = Buffer.from(bytes)
+    const central = bytes.readUInt32LE(bytes.length - 6)
+    badSignature[central - 33] ^= 1
+    fixture(`${test.name}-tampered-signature`, badSignature, { packageName: 'com.algorithm.fixture', cert: '' })
+    const badContent = Buffer.from(bytes)
+    badContent[5] ^= 1
+    fixture(`${test.name}-tampered-content`, badContent, { packageName: 'com.algorithm.fixture', cert: '' })
+  }
+  // A stored resource forces the first ZIP region across the 1 MiB digest boundary.
+  const largeSigned = zip([
+    { name: 'module.json', data: configuration('com.algorithm.fixture') },
+    { name: 'resources/padding.bin', data: Buffer.alloc(1024 * 1024 + 1337, 0x5a), method: 0 }
+  ])
+  fixture('multiple-digest-chunks', largeSigned, { packageName: 'com.algorithm.fixture' })
+  const badSecondChunk = Buffer.from(largeSigned)
+  badSecondChunk[1024 * 1024 + 100] ^= 1
+  fixture('multiple-digest-chunks-tampered', badSecondChunk, { packageName: 'com.algorithm.fixture', cert: '' })
+
   fixture('stored', zip([{ ...ordinary[0], method: 0 }]))
   fixture('raw-stored-block', zip([{ ...ordinary[0], options: { level: 0 } }]))
   fixture('fixed-huffman', zip([{ ...ordinary[0], options: { strategy: constants.Z_FIXED } }]))
@@ -212,7 +321,8 @@ try {
   fixture('old-signature-magic', zip(ordinary, { version: 2, comment: 'ZIP comment with PK markers' }))
   fixture('ski-signer', zip(ordinary, { blocks: [signature(cms({ ski: true }))] }))
   fixture('ber-signed-data', zip(ordinary, { blocks: [signature(cms({ ber: true }))] }))
-  fixture('unknown-signature-block', zip(ordinary, { blocks: [{ type: 0x12345678, data: Buffer.from('ignored') }, signature()] }))
+  fixture('unknown-signature-block', zip(ordinary, { blocks: [{ type: 0x12345678, data: Buffer.from('ignored') }, signature()] }), { cert: '' })
+  fixture('known-optional-block', zip(ordinary, { blocks: [{ type: 0x20000002, data: Buffer.from('bound optional data') }, signature()] }))
   fixture('unmatched-signer', zip(ordinary, { blocks: [signature(cms({ wrongSigner: true }))] }), { cert: '' })
   fixture('duplicate-signature-block', zip(ordinary, { blocks: [signature(), signature()] }), { cert: '' })
   fixture('bad-asn-length', zip(ordinary, { blocks: [signature(Buffer.from([0x30, 0x82, 0xff, 0xff, 0]))] }), { cert: '' })
@@ -238,10 +348,23 @@ try {
     if (official.length !== 96577 || createHash('sha256').update(official).digest('hex') !== sourceSha256) {
       throw new Error('pinned official HAP size or SHA-256 mismatch')
     }
-    fixture('official-screenshot', official, { packageName: 'com.ohos.screenshot', packageVersion: '1.0.0', code: 1000000,
+    const officialOptions = { packageName: 'com.ohos.screenshot', packageVersion: '1.0.0', code: 1000000,
       cert: '8e93863fc32ee238060bf69a9b37e2608fffb21f93c862dd511cbac9f30024b5', permissions: [
         'ohos.permission.MEDIA_LOCATION', 'ohos.permission.GET_BUNDLE_INFO_PRIVILEGED', 'ohos.permission.CAPTURE_SCREEN',
-        'ohos.permission.START_ABILITIES_FROM_BACKGROUND', 'ohos.permission.WRITE_IMAGEVIDEO'] })
+        'ohos.permission.START_ABILITIES_FROM_BACKGROUND', 'ohos.permission.WRITE_IMAGEVIDEO'] }
+    fixture('official-screenshot', official, officialOptions)
+    const central = official.readUInt32LE(official.length - 6)
+    const start = central - Number(official.readBigUInt64LE(central - 28))
+    const positions = [5, central + 4]
+    for (let index = 0; index < official.readUInt32LE(central - 32); index++) {
+      const at = start + index * 12
+      positions.push(start + official.readUInt32LE(at + 8) + official.readUInt32LE(at + 4) - 1)
+    }
+    for (const [index, position] of positions.entries()) {
+      const changed = Buffer.from(official)
+      changed[position] ^= 1
+      fixture(`official-tampered-${index}`, changed, { ...officialOptions, cert: '' })
+    }
   }
   writeFileSync(join(directory, 'installers', 'a-installed.hap'), zip([{ name: 'module.json', data: configuration('com.test.installed') }]))
   writeFileSync(join(directory, 'installers', 'b-residue.hap'), zip([{ name: 'module.json', data: configuration('com.test.removed') }]))
@@ -268,10 +391,22 @@ export default {
 };
 `)
   writeFileSync(join(directory, 'crypto-sdk.mjs'), `
-import { createHash } from 'node:crypto';
-export default { createMd(name) { const hash = createHash(name.toLowerCase()); return {
-  updateSync(input) { hash.update(input.data); }, digestSync() { return { data: new Uint8Array(hash.digest()) }; }
-}; }};
+import { createHash, createPublicKey, verify } from 'node:crypto';
+let verifyAvailable = true;
+export function setVerifyAvailable(value) { verifyAvailable = value; }
+export default {
+  createMd(name) { const hash = createHash(name.toLowerCase()); return {
+    updateSync(input) { hash.update(input.data); }, digestSync() { return { data: new Uint8Array(hash.digest()) }; }
+  }; },
+  createAsyKeyGenerator(name) { return { convertKeySync(pub) {
+    return { pubKey: createPublicKey({ key: Buffer.from(pub.data), format: 'der', type: 'spki' }) };
+  } }; },
+  createVerify(name) { if (!verifyAvailable) throw new Error('verification unavailable'); let key; return {
+    initSync(pub) { key = pub; },
+    verifySync(data, signature) { return verify(name.match(/SHA(?:256|384|512)/)[0].toLowerCase(),
+      data.data, key, signature.data); }
+  }; }
+};
 `)
   writeFileSync(join(directory, 'hilog-sdk.mjs'), 'export const hilog = {info(){},warn(){},error(){}};\n')
   for (const [from, to] of files) {
@@ -286,10 +421,32 @@ export default { createMd(name) { const hash = createHash(name.toLowerCase()); r
     writeFileSync(join(directory, to), source)
   }
   writeFileSync(join(directory, 'main.ts'), `
-import { readFileSync } from 'node:fs';
+import assert from 'node:assert/strict';
+import { readFileSync, openSync, closeSync } from 'node:fs';
+import { HapReader } from './HapReader.ts';
+import { verifiedHapCertificate } from './HapSignature.ts';
+import { setVerifyAvailable } from './crypto-sdk.mjs';
 import { runHapReaderChecks } from './HapReader.test.ts';
 const fixtures = JSON.parse(readFileSync(new URL('./fixtures.json', import.meta.url), 'utf8'));
 runHapReaderChecks(fixtures, '${virtualRoot}/installers', '${virtualRoot}/cancel.bin');
+const storedPath = new URL('./fixtures/stored.hap', import.meta.url);
+const stored = readFileSync(storedPath);
+const ending = stored.length - 22;
+const central = stored.readUInt32LE(ending + 16);
+let calls = 0;
+assert.equal(verifiedHapCertificate(stored, central, ending, () => ++calls > 25).length, 0);
+assert.equal(calls, 26);
+setVerifyAvailable(false);
+const fd = openSync(storedPath, 'r');
+try {
+  const unavailable = new HapReader().read(fd);
+  assert.equal(unavailable.certSha256, '');
+  assert.equal(unavailable.certAlgo, 'none');
+  assert.equal(unavailable.bundleName, 'com.test.fixture');
+  assert.equal(unavailable.sha256.length, 64);
+} finally { closeSync(fd); setVerifyAvailable(true); }
+assert(verifiedHapCertificate(stored, central, ending, () => false).length > 0);
+
 process.stdout.write('HapReader, BundleFinger and InstallerScan checks passed (' + fixtures.length + ' archives${withOfficialHap ? ', including pinned official ScreenShot.hap' : ', offline fixtures'})\\n');
 `)
   const result = spawnSync(process.execPath, ['--experimental-strip-types', join(directory, 'main.ts')], { encoding: 'utf8' })
