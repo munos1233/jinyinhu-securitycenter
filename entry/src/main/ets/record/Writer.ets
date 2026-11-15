@@ -16,7 +16,7 @@ import type {
   ScanHit,
   ScanReport
 } from '../center/CenterTypes'
-import { settledHome } from '../feature/exam/ExamState'
+import { settledHome, settleStoppedExam } from '../feature/exam/ExamState'
 import type { HomeCandidate } from '../feature/exam/ExamState'
 
 const DOMAIN: number = 0x4A59
@@ -252,16 +252,68 @@ export class Writer {
       hilog.error(DOMAIN, TAG, 'index.json parse failed')
       return
     }
+    let stopped: IndexRow[] = []
     for (let i = 0; i < records.length; i++) {
       let row = records[i]
       if (row.state === 'queued' || row.state === 'running') {
         row.state = 'interrupted'
         row.finishedAt = nowIso()
         row.summary = INTERRUPTED
+        stopped.push(row)
       }
     }
     let trimmed = Writer.trim(records)
     Writer.replaceNow(INDEX_PATH, JSON.stringify(Writer.plainIndex(trimmed)))
+    for (let i = 0; i < stopped.length; i++) {
+      Writer.settleExamNow(stopped[i])
+    }
+  }
+
+  /** 体检停在半路时收口它的结果文件。不是体检、没有结果文件或解析不成 ExamReport 时什么也不写。 */
+  static settleExam(record: JobRecord): void {
+    Writer.exclusive(() => {
+      Writer.settleExamNow(record)
+    })
+  }
+
+  private static settleExamNow(record: JobRecord): void {
+    if (Writer.files === null || record.kind !== 'exam' || record.jobId.length === 0) {
+      return
+    }
+    let path = Writer.resultPath(record)
+    Writer.adopt(path)
+    let text = Writer.files.read(path)
+    if (text === null) {
+      return
+    }
+    let report = Writer.parseExam(text)
+    if (report === null) {
+      hilog.error(DOMAIN, TAG, 'stopped exam result is not an ExamReport')
+      return
+    }
+    settleStoppedExam(report, record.jobId)
+    Writer.replaceNow(path, JSON.stringify(report))
+  }
+
+  private static parseExam(text: string): ExamReport | null {
+    try {
+      let parsed = JSON.parse(text) as ExamStub
+      if (parsed === null || typeof parsed !== 'object' || !(parsed.items instanceof Array) ||
+        !(parsed.apps instanceof Array) || parsed.summary === null || typeof parsed.summary !== 'object') {
+        return null
+      }
+      if (typeof parsed.appsComplete !== 'boolean') {
+        parsed.appsComplete = false
+      }
+      let summary = parsed.summary
+      summary.riskApps = typeof summary.riskApps === 'number' ? summary.riskApps : 0
+      summary.suspiciousApps = typeof summary.suspiciousApps === 'number' ? summary.suspiciousApps : 0
+      summary.unknownApps = typeof summary.unknownApps === 'number' ? summary.unknownApps : 0
+      summary.okApps = typeof summary.okApps === 'number' ? summary.okApps : 0
+      return parsed
+    } catch (err) {
+      return null
+    }
   }
 
   private static readIndex(): IndexRow[] {

@@ -378,7 +378,51 @@ export function runWriterStoreChecks(): void {
     fail('recover 改了已经 done 的体检')
   }
   if (files.read(done.resultFile) !== '{"state":"clear"}') {
-    fail('recover 改了结果文件，像是调用了 settleStoppedExam')
+    fail('recover 改了另一条已经 done 的体检结果')
+  }
+
+  let halfExam = record('ex-run', 5, 'exam', 'running')
+  let lostExam = record('ex-none', 6, 'exam', 'queued')
+  let settledDone = record('ex-done', 4, 'exam', 'done')
+  let half = new ExamBody()
+  half.jobId = 'ex-run'
+  half.state = 'clear'
+  half.appsComplete = false
+  let pureOk = new CheckLine()
+  pureOk.id = 'exam.protect.pure-mode'
+  pureOk.group = 'protect'
+  pureOk.status = 'ok'
+  let appsLine = new CheckLine()
+  appsLine.status = 'ok'
+  half.items = [pureOk, appsLine]
+  half.apps = [hit('risk'), hit('suspicious')]
+  let settledDoneBody = new ExamBody()
+  settledDoneBody.jobId = 'ex-done'
+  settledDoneBody.apps = [hit('risk')]
+  let settledDoneText = JSON.stringify(settledDoneBody)
+  files.write(halfExam.resultFile, JSON.stringify(half))
+  files.write(settledDone.resultFile, settledDoneText)
+  files.write(INDEX, JSON.stringify([settledDone, halfExam, lostExam]))
+  Writer.recover()
+  let settledRows = JSON.parse(files.read(INDEX) as string) as Stored[]
+  if (settledRows[1].state !== 'interrupted' || settledRows[2].state !== 'interrupted') {
+    fail('recover 收口体检后作业状态应保持 interrupted')
+  }
+  let settled = JSON.parse(files.read(halfExam.resultFile) as string) as ExamBody
+  let settledApps = settled.items[1]
+  if (settled.state !== 'risk' || settled.summary.riskApps !== 1 || settled.summary.suspiciousApps !== 1 ||
+    settledApps.status !== 'risk' || settled.appsComplete) {
+    fail('recover 没有对中断的体检调用 settleStoppedExam')
+  }
+  if (settled.items.length !== 3 || settled.items[2].id !== 'exam.malware.suspicious' ||
+    settled.items[2].action.params !== 'ex-run') {
+    fail('recover 收口时没有补上可疑应用项')
+  }
+  if (files.read(lostExam.resultFile) !== null) {
+    fail('没有结果文件的中断体检被合成了一份结果')
+  }
+  if (files.read(settledDone.resultFile) !== settledDoneText) {
+    fail('recover 改了另一条已经 done 的体检结果')
   }
 
   let many: Stored[] = []

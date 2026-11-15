@@ -16,10 +16,12 @@ import type {
 import type { HomeCandidate } from '../main/ets/feature/exam/ExamState'
 import {
   appendExamAppsDetail,
+  examAnyOffline,
   examAppsStatus,
   examWritebackTargets,
   homeExam,
   settledHome,
+  settleStoppedExam,
   stateOf
 } from '../main/ets/feature/exam/ExamState'
 
@@ -147,7 +149,184 @@ function hit(action: 'none' | 'quarantine', level: 'ok' | 'suspicious', reason: 
   return value
 }
 
+function row(level: 'ok' | 'unknown' | 'suspicious' | 'risk', action: 'none' | 'quarantine'): ScanHit {
+  let value = new Hit()
+  value.action = action
+  let verdict = new VerdictValue()
+  verdict.level = level
+  value.verdict = verdict
+  return value
+}
+
+function offlineRow(level: 'ok' | 'suspicious', source: 'local-rule' | 'cloud'): ScanHit {
+  let value = row(level, 'none')
+  value.verdict.source = source
+  value.verdict.cloud = 'offline'
+  return value
+}
+
+function appsItem(status: CheckStatus, detail: string): CheckItem {
+  let value = item('exam.malware.apps', status, status !== 'unsupported', 'state')
+  value.group = 'threat'
+  value.detail = detail
+  return value
+}
+
+function stopped(items: CheckItem[], apps: ScanHit[], appsComplete: boolean): Report {
+  let report = new Report()
+  report.jobId = 'job-9-00000000'
+  report.state = 'clear'
+  report.items = items
+  report.apps = apps
+  report.appsComplete = appsComplete
+  return report
+}
+
+function findIn(report: ExamReport, id: string): CheckItem | null {
+  for (let i = 0; i < report.items.length; i++) {
+    if (report.items[i].id === id) {
+      return report.items[i]
+    }
+  }
+  return null
+}
+
+function settleChecks(): void {
+  let pure = item('exam.protect.pure-mode', 'ok', true, 'state')
+  let hidden = stopped([pure, appsItem('ok', '')], [row('risk', 'none'), row('ok', 'none')], false)
+  settleStoppedExam(hidden, 'job-9-00000000')
+  let hiddenApps = findIn(hidden, 'exam.malware.apps')
+  if (hidden.summary.riskApps !== 1 || hidden.state !== 'risk' || hiddenApps === null ||
+    hiddenApps.status !== 'risk') {
+    fail('riskApps 为 0 而 apps[] 有 action===none 的 risk 时，收口后应是 risk，riskApps 等于行数')
+  }
+  if (hidden.appsComplete || hiddenApps.detail.indexOf('本次扫描未完成') < 0) {
+    fail('appsComplete 为 false 时应保持 false，详情含本次扫描未完成')
+  }
+
+  let quarantined = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', '')],
+    [row('risk', 'quarantine')], true)
+  settleStoppedExam(quarantined, 'job-9-00000000')
+  if (quarantined.summary.riskApps !== 0 || quarantined.state !== 'clear') {
+    fail('已处理的 risk 行不应计入 riskApps 或把 state 改成 risk')
+  }
+
+  let truncated = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', '')],
+    [row('ok', 'none'), row('ok', 'none')], true)
+  truncated.summary.okApps = 120
+  truncated.summary.riskApps = 3
+  truncated.summary.unknownApps = 4
+  settleStoppedExam(truncated, 'job-9-00000000')
+  if (truncated.summary.okApps !== 120 || truncated.summary.riskApps !== 3 || truncated.summary.unknownApps !== 4) {
+    fail('settleStoppedExam 把计数改小了')
+  }
+  if (truncated.state !== 'risk') {
+    fail('summary.riskApps 已大于 0 时应用信誉项应是 risk')
+  }
+
+  let mixed = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', '')],
+    [row('risk', 'none'), row('ok', 'none')], true)
+  mixed.summary.okApps = 120
+  mixed.summary.unknownApps = 4
+  settleStoppedExam(mixed, 'job-9-00000000')
+  if (mixed.summary.riskApps !== 1 || mixed.summary.okApps !== 120 || mixed.summary.unknownApps !== 4) {
+    fail('抬高 riskApps 时不得顺带把 okApps 或 unknownApps 改成 apps[] 的行数')
+  }
+
+  let noItemRisk = stopped([item('exam.protect.pure-mode', 'ok', true, 'state')], [row('risk', 'none')], false)
+  settleStoppedExam(noItemRisk, 'job-9-00000000')
+  let blockedRisk = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'),
+    appsItem('unsupported', '无法获取应用列表')], [row('risk', 'none')], false)
+  settleStoppedExam(blockedRisk, 'job-9-00000000')
+  if (noItemRisk.state !== 'risk' || blockedRisk.state !== 'risk') {
+    fail('apps[] 已有 action===none 的 risk 时，没有或暂不支持应用信誉项也应是 risk')
+  }
+
+  let cacheStage = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', '')],
+    [row('ok', 'none')], true)
+  settleStoppedExam(cacheStage, 'job-9-00000000')
+  let cacheApps = findIn(cacheStage, 'exam.malware.apps')
+  if (!cacheStage.appsComplete || cacheApps === null || cacheApps.detail.indexOf('本次扫描未完成') >= 0 ||
+    cacheApps.status !== 'ok' || cacheStage.state !== 'clear') {
+    fail('应用循环已写完时取消，appsComplete 应保持 true，详情不含本次扫描未完成')
+  }
+  if (cacheStage.summary.okApps !== 1) {
+    fail('四个数都是 0 时应按 apps[] 行数抬高')
+  }
+
+  let noApps = stopped([item('exam.protect.pure-mode', 'ok', true, 'state')], [], false)
+  settleStoppedExam(noApps, 'job-9-00000000')
+  if (noApps.state !== 'incomplete' || findIn(noApps, 'exam.malware.apps') !== null) {
+    fail('还没有应用信誉项时不补通过项，state 不能是 clear')
+  }
+
+  let unsupported = appsItem('unsupported', '无法获取应用列表')
+  let blocked = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), unsupported], [], false)
+  settleStoppedExam(blocked, 'job-9-00000000')
+  if (unsupported.status !== 'unsupported' || unsupported.countsTowardState ||
+    unsupported.detail !== '无法获取应用列表' || blocked.state !== 'incomplete') {
+    fail('unsupported 的应用信誉项不应被改写')
+  }
+
+  let suspect = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', '')],
+    [row('suspicious', 'none'), row('ok', 'none')], true)
+  settleStoppedExam(suspect, 'job-9-00000000')
+  let added = findIn(suspect, 'exam.malware.suspicious')
+  if (added === null || added.title !== '可疑应用' || added.source !== 'local-rule' || added.detail !== '' ||
+    added.status !== 'attention' || added.group !== 'threat' || added.kind !== 'advice' ||
+    added.countsTowardState || added.action.route !== 'malware' || added.action.params !== 'job-9-00000000') {
+    fail('suspiciousApps>0 且缺失时应补上 exam.malware.suspicious')
+  }
+  if (suspect.summary.suspiciousApps !== 1 || suspect.state !== 'clear' || suspect.advice !== 1) {
+    fail('可疑项不改圆环，advice 计数应包含它')
+  }
+
+  let cleared = item('exam.malware.suspicious', 'attention', false, 'advice')
+  let gone = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', ''), cleared],
+    [row('ok', 'none')], true)
+  gone.advice = 1
+  settleStoppedExam(gone, 'job-9-00000000')
+  if (cleared.status !== 'ok' || gone.advice !== 0) {
+    fail('已有可疑项且 suspiciousApps 为 0 时应是 ok')
+  }
+  let none = stopped([item('exam.protect.pure-mode', 'ok', true, 'state'), appsItem('ok', '')], [], true)
+  settleStoppedExam(none, 'job-9-00000000')
+  if (findIn(none, 'exam.malware.suspicious') !== null) {
+    fail('suspiciousApps 为 0 且不存在时不补')
+  }
+
+  if (!examAnyOffline([offlineRow('ok', 'local-rule')]) || examAnyOffline([offlineRow('suspicious', 'local-rule')]) ||
+    examAnyOffline([offlineRow('ok', 'cloud')])) {
+    fail('anyOffline 只看 action===none、level===ok、source 不是 cloud、cloud===offline 的行')
+  }
+  let local = stopped([appsItem('ok', '')], [offlineRow('ok', 'local-rule')], true)
+  settleStoppedExam(local, 'job-9-00000000')
+  let localApps = findIn(local, 'exam.malware.apps')
+  if (localApps === null || localApps.detail !== '未联网') {
+    fail('本地 ok 离线行应让详情含未联网')
+  }
+  let onlySuspect = stopped([appsItem('ok', '')], [offlineRow('suspicious', 'local-rule')], true)
+  settleStoppedExam(onlySuspect, 'job-9-00000000')
+  let suspectApps = findIn(onlySuspect, 'exam.malware.apps')
+  if (suspectApps === null || suspectApps.detail.indexOf('未联网') >= 0) {
+    fail('只有可疑行离线时详情不含未联网')
+  }
+
+  let noCloud = row('ok', 'none')
+  noCloud.verdict.reason = '登记相符，云端暂无结果'
+  let heuristic = row('unknown', 'none')
+  heuristic.verdict.evidence = 'heuristic-cleared'
+  let tail = stopped([appsItem('ok', '')], [noCloud, heuristic], false)
+  settleStoppedExam(tail, 'job-9-00000000')
+  let tailApps = findIn(tail, 'exam.malware.apps')
+  if (tailApps === null || tailApps.status !== 'unknown' ||
+    tailApps.detail !== '本次扫描未完成、云端暂无结果、部分应用暂无法确认') {
+    fail('examAppsStatus 之后应补云端暂无结果和部分应用暂无法确认：' + (tailApps === null ? '' : tailApps.detail))
+  }
+}
+
 export function runExamStateChecks(): void {
+  settleChecks()
   if (!pureModeOk(1) || !pureModeOk(true) || !pureModeOk('1')) {
     fail('pureModeOk 应接受 1、true、字符串 1')
   }

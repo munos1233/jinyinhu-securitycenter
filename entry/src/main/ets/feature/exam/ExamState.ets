@@ -1,12 +1,17 @@
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import type {
+  ActionRef,
   AppsItemStatus,
+  CheckGroup,
   CheckItem,
+  CheckKind,
   CheckStatus,
   ExamReport,
   ExamState,
   JobRecord,
-  ScanHit
+  RiskLevel,
+  ScanHit,
+  VerdictSource
 } from '../../center/CenterTypes'
 
 const DOMAIN: number = 0x4A59
@@ -17,6 +22,8 @@ const UNFINISHED: string = '本次扫描未完成'
 const OFFLINE: string = '未联网'
 const NO_CLOUD: string = '云端暂无结果'
 const UNCONFIRMED: string = '部分应用暂无法确认'
+const APPS_ID: string = 'exam.malware.apps'
+const SUSPICIOUS_ID: string = 'exam.malware.suspicious'
 
 export interface HomeCandidate {
   record: JobRecord
@@ -37,6 +44,23 @@ class AppsItemStatusValue implements AppsItemStatus {
 class HomePickValue implements HomePick {
   jobId: string = ''
   banner: string = ''
+}
+
+class MalwareAction implements ActionRef {
+  route: string = 'malware'
+  params: string = ''
+}
+
+class SuspiciousItem implements CheckItem {
+  id: string = SUSPICIOUS_ID
+  title: string = '可疑应用'
+  group: CheckGroup = 'threat'
+  status: CheckStatus = 'attention'
+  kind: CheckKind = 'advice'
+  source: VerdictSource = 'local-rule'
+  detail: string = ''
+  action: ActionRef = new MalwareAction()
+  countsTowardState: boolean = false
 }
 
 function pick(jobId: string, banner: string): HomePick {
@@ -230,6 +254,95 @@ export function appendExamAppsDetail(detail: string, apps: ScanHit[]): string {
     }
   }
   return joinSentences(hasSentence(detail, UNFINISHED), hasSentence(detail, OFFLINE), noCloud, unconfirmed)
+}
+
+/** 只有本地 ok 的离线行算数。可疑、未知和风险行即使 cloud=offline 也不算。 */
+export function examAnyOffline(apps: ScanHit[]): boolean {
+  for (let i = 0; i < apps.length; i++) {
+    let verdict = apps[i].verdict
+    if (apps[i].action === 'none' && verdict.level === 'ok' && verdict.source !== 'cloud' &&
+      verdict.cloud === 'offline') {
+      return true
+    }
+  }
+  return false
+}
+
+function liveRows(apps: ScanHit[], level: RiskLevel): number {
+  let count = 0
+  for (let i = 0; i < apps.length; i++) {
+    if (apps[i].action === 'none' && apps[i].verdict.level === level) {
+      count++
+    }
+  }
+  return count
+}
+
+function findItem(items: CheckItem[], id: string): CheckItem | null {
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].id === id) {
+      return items[i]
+    }
+  }
+  return null
+}
+
+function adviceCount(items: CheckItem[]): number {
+  let count = 0
+  for (let i = 0; i < items.length; i++) {
+    if (items[i].kind === 'advice' && items[i].status !== 'ok') {
+      count++
+    }
+  }
+  return count
+}
+
+/**
+ * 中断、取消或失败的体检收口。只改这份结果，不碰作业状态。
+ * 四个计数只升不降，appsComplete 原样保留。
+ */
+export function settleStoppedExam(report: ExamReport, jobId: string): void {
+  let summary = report.summary
+  let risk = liveRows(report.apps, 'risk')
+  let suspicious = liveRows(report.apps, 'suspicious')
+  let unknown = liveRows(report.apps, 'unknown')
+  let ok = liveRows(report.apps, 'ok')
+  if (risk > summary.riskApps || suspicious > summary.suspiciousApps || unknown > summary.unknownApps ||
+    ok > summary.okApps) {
+    hilog.warn(DOMAIN, TAG, 'settleStoppedExam raised counts to apps rows %{public}d/%{public}d/%{public}d/%{public}d',
+      risk, suspicious, unknown, ok)
+    summary.riskApps = Math.max(summary.riskApps, risk)
+    summary.suspiciousApps = Math.max(summary.suspiciousApps, suspicious)
+    summary.unknownApps = Math.max(summary.unknownApps, unknown)
+    summary.okApps = Math.max(summary.okApps, ok)
+  }
+
+  let apps = findItem(report.items, APPS_ID)
+  if (apps !== null && apps.status !== 'unsupported') {
+    let status = examAppsStatus(apps.countsTowardState, report.appsComplete, summary.riskApps,
+      summary.unknownApps, examAnyOffline(report.apps))
+    apps.status = status.status
+    apps.detail = appendExamAppsDetail(status.detail, report.apps)
+  }
+
+  let advice = findItem(report.items, SUSPICIOUS_ID)
+  if (advice !== null) {
+    advice.status = summary.suspiciousApps > 0 ? 'attention' : 'ok'
+  } else if (summary.suspiciousApps > 0) {
+    let added = new SuspiciousItem()
+    added.action.params = jobId
+    report.items.push(added)
+  }
+  report.advice = adviceCount(report.items)
+
+  let state = stateOf(report.items)
+  if (apps === null && state === 'clear') {
+    state = 'incomplete'
+  }
+  if (risk > 0) {
+    state = 'risk'
+  }
+  report.state = state
 }
 
 export function homeExam(rows: HomeCandidate[]): HomePick {

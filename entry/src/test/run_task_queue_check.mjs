@@ -45,7 +45,7 @@ for (const path of added) {
     }
   }
   if (body.includes('settleStoppedExam')) {
-    problems.push(`${path} 本 issue 不调用 settleStoppedExam`)
+    problems.push(`${path} 经 Writer.settleExam 收口，不直接调用 settleStoppedExam`)
   }
   for (const banned of ['已安全', '云查杀已开启', '已防护', '已拦截', '人工智能引擎已防护', '正在扫描']) {
     if (source.includes(banned)) {
@@ -72,6 +72,25 @@ if (!queue.includes("'center.job.light'") || !queue.includes("'center.job.heavy'
 }
 if (/index\.json|Writer\.files|seq = [^\n]*nowIso/.test(queue) || !queue.includes('record.seq = Writer.nextSeq(rows)')) {
   problems.push('车道不直接改索引，seq 经 Writer 分配，不读时钟')
+}
+
+if ((queue.match(/Writer\.settleExam\(/g) || []).length !== 1 ||
+  !/if \(end\.state === 'cancelled'\) \{\s*Writer\.settleExam\(job\.record\)/.test(queue)) {
+  problems.push('JobQueue 只在作业记 cancelled 后调用一次 Writer.settleExam')
+}
+const runnerSource = code(read('entry/src/main/ets/task/JobRunner.ets'))
+if ((runnerSource.match(/Writer\.settleExam\(/g) || []).length !== 1 ||
+  !/if \(end\.state === 'failed'\) \{\s*Writer\.settleExam\(live\)/.test(runnerSource) ||
+  !runnerSource.includes('isWorkerDown(err)')) {
+  problems.push('JobRunner 只在 Runner 抛错或 Worker 起不来记 failed 时调用一次 Writer.settleExam')
+}
+const writerSource = code(read('entry/src/main/ets/record/Writer.ets'))
+if (!/row\.summary = INTERRUPTED\n\s*stopped\.push\(row\)/.test(writerSource) ||
+  !/Writer\.replaceNow\(INDEX_PATH, JSON\.stringify\(Writer\.plainIndex\(trimmed\)\)\)\n\s*for \(let i = 0; i < stopped\.length; i\+\+\) \{\n\s*Writer\.settleExamNow\(stopped\[i\]\)/.test(writerSource)) {
+  problems.push('Writer.recover 在作业写成 interrupted 之后再收口体检')
+}
+if ((writerSource.match(/settleStoppedExam\(/g) || []).length !== 1) {
+  problems.push('Writer 只在 settleExamNow 里调用 settleStoppedExam')
 }
 
 const contexts = read('entry/src/main/ets/task/Contexts.ets')

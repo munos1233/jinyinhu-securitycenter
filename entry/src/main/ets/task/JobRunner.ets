@@ -6,6 +6,7 @@ import type {
   AccessFacts, CacheStats, FileSource, GrantLookup, JobRecord, JobState, PosturePort
 } from '../center/CenterTypes'
 import type { AppJudge } from '../engine/AppJudge'
+import { isWorkerDown } from '../engine/HashWorker'
 import { Writer } from '../record/Writer'
 import type { BundleCensus } from '../system/BundleCensus'
 import type { FileOpen } from '../system/FileOpen'
@@ -71,14 +72,18 @@ export class JobRunner {
   /**
    * live 是这条作业在内存里的记录，结果文件写下后回填 resultFile。
    * processed 是最近一次 report 的 done，Runner 抛错或取消时作为 itemCount。
-   * 已写入的结果文件一律保留。本轮不调用 settleStoppedExam。
+   * 已写入的结果文件一律保留。Runner 抛错记 failed 时，体检结果在这里收口；取消由 JobQueue 收口。
    */
   async run(base: JobBase, live: JobRecord, processed: () => number): Promise<JobEnd> {
     let out: RunEnd | null = null
     try {
       out = await this.dispatch(base, new Hand(live))
     } catch (err) {
-      return thrown(err as Object, base, processed())
+      let end = thrown(err as Object, base, processed())
+      if (end.state === 'failed') {
+        Writer.settleExam(live)
+      }
+      return end
     }
     let end = new JobEnd()
     if (out === null) {
@@ -148,6 +153,12 @@ function thrown(err: Object, base: JobBase, processed: number): JobEnd {
   if (base.cancel.cancelled() || (err instanceof CenterError && err.code === 'cancelled')) {
     end.state = 'cancelled'
     end.summary = centerErrorMessage('cancelled')
+    return end
+  }
+  if (isWorkerDown(err)) {
+    hilog.error(DOMAIN, TAG, 'runner %{public}s lost hash worker', base.request.kind)
+    end.state = 'failed'
+    end.summary = centerErrorMessage('io')
     return end
   }
   if (!(err instanceof CenterError)) {
