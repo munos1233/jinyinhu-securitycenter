@@ -399,9 +399,9 @@ function checkExamLook(): void {
 }
 
 function checkRoutes(): void {
-  let wantPages = ['home', 'exam', 'malware', 'clean', 'permission', 'quarantine', 'job', 'P1', 'P2', 'P3', 'ledger', 'report',
+  let wantPages = ['home', 'exam', 'malware', 'clean', 'permission', 'apps', 'protect', 'quarantine', 'job', 'P1', 'P2', 'P3', 'ledger', 'report',
     'archive', 'device', 'about']
-  let wantPending = ['apps', 'protect']
+  let wantPending: string[] = []
   if (PAGE_ROUTES.slice().sort().join(',') !== wantPages.slice().sort().join(',') ||
     PENDING_ROUTES.slice().sort().join(',') !== wantPending.slice().sort().join(',')) {
     fail('路由登记不对')

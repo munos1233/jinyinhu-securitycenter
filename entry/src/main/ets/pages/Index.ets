@@ -1,6 +1,7 @@
 import { Theme } from '../common/Theme';
 import { probeName } from '../model/ProbeStatus';
 import { ArchiveView } from './ArchiveView';
+import { AppsView } from './AppsView';
 import { CleanView } from './CleanView';
 import { DeviceView } from './DeviceView';
 import { ExamView } from './ExamView';
@@ -9,17 +10,17 @@ import { JobResultView } from './JobResultView';
 import { LedgerView } from './LedgerView';
 import { MalwareView } from './MalwareView';
 import { PermissionView } from './PermissionView';
+import { ProtectView } from './ProtectView';
 import { QuarantineView } from './QuarantineView';
 import { ScanView } from './ScanView';
 import { SocView } from './SocView';
 
 /** 已有页面的路由。 */
 export const PAGE_ROUTES: string[] = [
-  'home', 'exam', 'malware', 'clean', 'permission', 'quarantine', 'job', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about'
+  'home', 'exam', 'malware', 'clean', 'permission', 'apps', 'protect', 'quarantine', 'job', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about'
 ];
 /** 页面由后续 issue 落地，现在只有占位。 */
 export const PENDING_ROUTES: string[] = [
-  'apps', 'protect'
 ];
 
 @Entry
@@ -96,6 +97,12 @@ struct Index {
         QuarantineView()
       } else if (route === 'permission') {
         PermissionView({ params: routeParams(param) })
+      } else if (route === 'apps') {
+        AppsView()
+      } else if (route === 'protect') {
+        ProtectView({ params: routeParams(param), onOpen: (next: string, params: string) => {
+          this.open(next, params);
+        } })
       } else if (PENDING_ROUTES.indexOf(route) >= 0) {
         pendingPage()
       }

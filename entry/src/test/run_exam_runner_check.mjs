@@ -76,9 +76,8 @@ if (/from '\.\.\/(feature|pages)\//.test(registry)) {
   problems.push('RunnerRegistry 在 task 里，不 import feature 或页面')
 }
 const registerBody = code(registry).match(/static registerAll\(.*\): void \{([\s\S]*?)\n {2}\}/)
-if (registerBody === null || !/table\.exam = runners\.exam/.test(registerBody[1]) ||
-  /table\.(apps|protect)\s*=/.test(registerBody[1])) {
-  problems.push('RunnerRegistry.registerAll 登记 exam，不登记 apps/protect')
+if (registerBody === null || !/table\.exam = runners\.exam/.test(registerBody[1])) {
+  problems.push('RunnerRegistry.registerAll 登记 exam')
 }
 
 if (problems.length > 0) {

@@ -68,6 +68,8 @@ export class RunnerSet {
   duplicate: FileToolRun | null = null
   largeFile: FileToolRun | null = null
   permission: PermissionRun | null = null
+  apps: AppsRun | null = null
+  protect: ProtectRun | null = null
 }
 
 export class RunnerRegistry {
@@ -82,6 +84,8 @@ export class RunnerRegistry {
     table.duplicate = runners.duplicate
     table.largeFile = runners.largeFile
     table.permission = runners.permission
+    table.apps = runners.apps
+    table.protect = runners.protect
     RunnerRegistry.current = table
   }
 

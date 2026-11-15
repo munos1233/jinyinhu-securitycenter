@@ -101,9 +101,8 @@ const registerBody = code(registry).match(/static registerAll\(.*\): void \{([\s
 if (registerBody === null ||
   !/table\.clean = runners\.clean/.test(registerBody[1]) ||
   !/table\.duplicate = runners\.duplicate/.test(registerBody[1]) ||
-  !/table\.largeFile = runners\.largeFile/.test(registerBody[1]) ||
-  /table\.(apps|protect)\s*=/.test(registerBody[1])) {
-  problems.push('RunnerRegistry.registerAll 只追加 clean、duplicate、large-file')
+  !/table\.largeFile = runners\.largeFile/.test(registerBody[1])) {
+  problems.push('RunnerRegistry.registerAll 登记 clean、duplicate、large-file')
 }
 
 if (problems.length > 0) {

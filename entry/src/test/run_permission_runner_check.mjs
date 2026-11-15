@@ -79,6 +79,12 @@ runners.permission = (context, hand) => runner.run(context, hand);
 RunnerRegistry.registerAll(runners);
 assert.equal(RunnerRegistry.table().has('permission'), true);
 assert.equal(RunnerRegistry.table().has('apps'), false);
+runners.apps = async () => ({ itemCount: 0, riskCount: 0, summary: '' });
+runners.protect = async () => ({ itemCount: 0, riskCount: 0, summary: '' });
+RunnerRegistry.registerAll(runners);
+assert.equal(RunnerRegistry.table().has('permission'), true);
+assert.equal(RunnerRegistry.table().has('apps'), true);
+assert.equal(RunnerRegistry.table().has('protect'), true);
 process.stdout.write('PermissionRunner census, limits, cancellation, and registry checks passed\\n');
 `)
   const run = spawnSync(process.execPath, ['--experimental-strip-types', join(dir, 'main.ts')], { encoding: 'utf8' })
