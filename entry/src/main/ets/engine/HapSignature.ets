@@ -5,6 +5,9 @@ const SIGNED_DATA: string = '2a864886f70d010702'
 const DATA: string = '2a864886f70d010701'
 const CONTENT_TYPE: string = '2a864886f70d010903'
 const MESSAGE_DIGEST: string = '2a864886f70d010904'
+const RSA_PSS: string = '2a864886f70d01010a'
+const MGF1: string = '2a864886f70d010108'
+const SHA1: string = '2b0e03021a'
 const SIGNATURE_BLOCK: number = 0x20000000
 const CHUNK_SIZE: number = 1048576
 const MAX_ASN_NODES: number = 16384
@@ -45,6 +48,7 @@ class Algorithm {
   signatureOid: string = ''
   family: string = ''
   digestLength: number = 0
+  padding: string = ''
 }
 
 class CmsSignature {
@@ -55,6 +59,7 @@ class CmsSignature {
   algorithm: Algorithm = new Algorithm()
   keyAlgorithm: string = ''
   publicKey: Uint8Array = new Uint8Array(0)
+  saltLength: number = 20
 }
 
 // The input is the same immutable, size-bounded snapshot used to parse metadata.
@@ -97,9 +102,16 @@ export function verifiedHapCertificate(bytes: Uint8Array, central: number, eocd:
     }
     let keys = cryptoFramework.createAsyKeyGenerator(cms.keyAlgorithm)
       .convertKeySync({ data: cms.publicKey }, null)
-    let mode = cms.keyAlgorithm + (cms.algorithm.family === 'RSA' ? '|PKCS1|' : '|') + cms.algorithm.digest
+    let mode = cms.keyAlgorithm + (cms.algorithm.family === 'RSA' ? '|' + cms.algorithm.padding + '|' : '|') +
+      cms.algorithm.digest
+    if (cms.algorithm.padding === 'PSS') {
+      mode += '|MGF1_' + cms.algorithm.digest
+    }
     let verify = cryptoFramework.createVerify(mode)
     verify.initSync(keys.pubKey)
+    if (cms.algorithm.padding === 'PSS') {
+      verify.setVerifySpec(cryptoFramework.SignSpecItem.PSS_SALT_LEN_NUM, cms.saltLength)
+    }
     return !stopped() && verify.verifySync({ data: cms.signed }, { data: cms.signature }) && !stopped()
       ? cms.certificate : empty
   } catch (err) {
@@ -207,9 +219,13 @@ function parseCms(bytes: Uint8Array, budget: ParseBudget): CmsSignature {
   let hasAttributes = signer[3].tag === 0xa0
   require(signer.length === (hasAttributes ? 6 : 5))
   let signatureIndex = hasAttributes ? 4 : 3
-  let signatureOid = algorithmOid(bytes, signer[signatureIndex], budget)
-  require(signatureOid === result.algorithm.signatureOid ||
-    (result.algorithm.family === 'RSA' && signatureOid === '2a864886f70d010101'))
+  if (result.algorithm.padding === 'PSS') {
+    result.saltLength = pssSaltLength(bytes, signer[signatureIndex], result.algorithm, budget)
+  } else {
+    let signatureOid = algorithmOid(bytes, signer[signatureIndex], budget)
+    require(signatureOid === result.algorithm.signatureOid ||
+      (result.algorithm.family === 'RSA' && signatureOid === '2a864886f70d010101'))
+  }
   require(signer[signatureIndex + 1].tag === 4)
   result.signature = bytes.slice(signer[signatureIndex + 1].content, signer[signatureIndex + 1].contentEnd)
   result.signed = hasAttributes ? signedAttributes(bytes, signer[3], result.content, result.algorithm, budget) : result.content
@@ -235,6 +251,11 @@ function parseCms(bytes: Uint8Array, budget: ParseBudget): CmsSignature {
   require(publicKey.tag === 0x30)
   result.publicKey = bytes.slice(publicKey.start, publicKey.end)
   result.keyAlgorithm = keyAlgorithm(bytes, publicKey, result.algorithm.family, budget)
+  if (result.algorithm.padding === 'PSS') {
+    let modulusBytes = Number.parseInt(result.keyAlgorithm.substring(3), 10) / 8
+    // EMSA-PSS uses emBits = modulusBits - 1. All supported RSA moduli are byte-aligned.
+    require(result.saltLength <= modulusBytes - result.algorithm.digestLength - 2)
+  }
   return result
 }
 
@@ -244,8 +265,13 @@ function algorithmFor(id: number): Algorithm {
   if (id >= 0x201 && id <= 0x203) {
     result.family = 'ECC'
     index = id - 0x201
+  } else if (id >= 0x101 && id <= 0x103) {
+    result.family = 'RSA'
+    result.padding = 'PSS'
+    index = id - 0x101
   } else if (id >= 0x104 && id <= 0x106) {
     result.family = 'RSA'
+    result.padding = 'PKCS1'
     index = id - 0x104
   } else {
     throw new Error('unsupported HAP signature algorithm')
@@ -255,7 +281,54 @@ function algorithmFor(id: number): Algorithm {
   result.digestOid = ['608648016503040201', '608648016503040202', '608648016503040203'][index]
   result.signatureOid = result.family === 'ECC'
     ? ['2a8648ce3d040302', '2a8648ce3d040303', '2a8648ce3d040304'][index]
-    : ['2a864886f70d01010b', '2a864886f70d01010c', '2a864886f70d01010d'][index]
+    : result.padding === 'PSS' ? RSA_PSS
+      : ['2a864886f70d01010b', '2a864886f70d01010c', '2a864886f70d01010d'][index]
+  return result
+}
+
+function pssSaltLength(bytes: Uint8Array, identifier: Node, algorithm: Algorithm, budget: ParseBudget): number {
+  require(identifier.tag === 0x30)
+  assertDer(bytes, identifier, 0, budget)
+  let fields = children(bytes, identifier, budget)
+  require(fields.length === 2 && oid(bytes, fields[0]) === RSA_PSS && fields[1].tag === 0x30)
+  let digestOid = SHA1
+  let maskDigestOid = SHA1
+  let saltLength = 20
+  let previousTag = 0x9f
+  for (let parameter of children(bytes, fields[1], budget)) {
+    // RSASSA-PSS-params is a SEQUENCE of ordered, explicitly tagged optional fields.
+    require(parameter.tag >= 0xa0 && parameter.tag <= 0xa3 && parameter.tag > previousTag)
+    previousTag = parameter.tag
+    let values = children(bytes, parameter, budget)
+    require(values.length === 1)
+    if (parameter.tag === 0xa0) {
+      digestOid = algorithmOid(bytes, values[0], budget)
+    } else if (parameter.tag === 0xa1) {
+      require(values[0].tag === 0x30)
+      let mask = children(bytes, values[0], budget)
+      require(mask.length === 2 && oid(bytes, mask[0]) === MGF1)
+      maskDigestOid = algorithmOid(bytes, mask[1], budget)
+    } else if (parameter.tag === 0xa2) {
+      saltLength = smallInteger(bytes, values[0])
+    } else {
+      require(smallInteger(bytes, values[0]) === 1)
+    }
+  }
+  // This implementation supports MGF1 with the HAP/CMS digest. Unsupported
+  // parameter combinations must not silently fall back to backend defaults.
+  require(digestOid === algorithm.digestOid && maskDigestOid === algorithm.digestOid)
+  return saltLength
+}
+
+function smallInteger(bytes: Uint8Array, value: Node): number {
+  let encoded = integer(bytes, value)
+  require(encoded.length <= 2)
+  let result = 0
+  for (let octet of encoded) {
+    result = result * 256 + octet
+  }
+  // No supported key can encode a PSS salt longer than its 512-byte modulus.
+  require(result <= 512)
   return result
 }
 

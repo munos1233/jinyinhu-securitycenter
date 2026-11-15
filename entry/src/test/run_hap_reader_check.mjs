@@ -68,7 +68,33 @@ const signer = certificate('HAP fixture signer', 42)
 const other = certificate('Other certificate first', 43)
 const certificateHash = createHash('sha256').update(signer.der).digest('hex')
 
-function cms({ ski = false, ber = false, wrongSigner = false, attributes = false, wrongAttrDigest = false, wrongContentType = false, multipleSigners = false, identity = signer, digestName = 'sha256' } = {}, content = null) {
+function hashIdentifier(digestName) {
+  const suffix = digestName === 'sha1' ? '2b0e03021a' :
+    ['608648016503040201', '608648016503040202', '608648016503040203'][digestIndex(digestName)]
+  return sequence(oid(suffix), value(5))
+}
+
+function pssIdentifier(pss, digestName) {
+  if (pss.nullParameters) return sequence(oid('2a864886f70d01010a'), value(5))
+  if (pss.missingParameters) return sequence(oid('2a864886f70d01010a'))
+  const fields = []
+  if (!pss.omitHash) fields.push(value(0xa0, hashIdentifier(pss.hashName ?? digestName)))
+  if (!pss.omitMgf) fields.push(value(0xa1, sequence(oid(pss.mgfOid ?? '2a864886f70d010108'),
+    hashIdentifier(pss.mgfHash ?? digestName))))
+  if (!pss.omitSalt) {
+    const salt = pss.negativeSalt ? value(2, Buffer.from([0xff])) :
+      integer(pss.saltLength ?? [32, 48, 64][digestIndex(digestName)])
+    fields.push(value(0xa2, salt))
+  }
+  if (pss.trailer !== undefined) fields.push(value(0xa3, integer(pss.trailer)))
+  if (pss.duplicateHash) fields.splice(1, 0, fields[0])
+  if (pss.reverseParameters) fields.reverse()
+  return sequence(oid('2a864886f70d01010a'), sequence(...fields))
+}
+
+function cms({ ski = false, ber = false, wrongSigner = false, attributes = false,
+  wrongAttrDigest = false, wrongContentType = false, multipleSigners = false,
+  identity = signer, digestName = 'sha256', pss = null } = {}, content = null) {
   const template = content === null
   content ??= Buffer.from('Unbound payload')
   const constructed = (tag, ...parts) => ber
@@ -82,14 +108,20 @@ function cms({ ski = false, ber = false, wrongSigner = false, attributes = false
     sequence(oid('2a864886f70d010904'), set(value(4, createHash(digestName).update(wrongAttrDigest ? Buffer.from('wrong digest') : content).digest())))
   ].sort(Buffer.compare)
   const signedContent = attributes ? set(...attrs) : content
+  const signatureAlgorithm = pss && !pss.pkcs1Identifier ? pssIdentifier(pss, digestName) :
+    sequence(oid(signatureOid(identity.family, digestName)))
+  const signKey = pss ? { key: identity.keys.privateKey,
+    padding: pss.pkcs1Signature ? cryptoConstants.RSA_PKCS1_PADDING : cryptoConstants.RSA_PKCS1_PSS_PADDING,
+    saltLength: pss.actualSaltLength ?? pss.saltLength ??
+      (pss.omitSalt ? 20 : [32, 48, 64][digestIndex(digestName)]) } : identity.keys.privateKey
   const info = sequence(integer(ski ? 3 : 1), sid, digest,
-    ...(attributes ? [value(0xa0, ...attrs)] : []), sequence(oid(signatureOid(identity.family, digestName))),
-    value(4, sign(digestName, signedContent, identity.keys.privateKey)))
+    ...(attributes ? [value(0xa0, ...attrs)] : []), signatureAlgorithm,
+    value(4, sign(digestName, signedContent, signKey)))
   const signedData = constructed(0x30, integer(ski ? 3 : 1), set(digest),
     sequence(oid('2a864886f70d010701'), value(0xa0, value(4, content))),
     constructed(0xa0, other.der, identity.der), set(...(multipleSigners ? [info, info] : [info])))
   const bytes = constructed(0x30, oid('2a864886f70d010702'), constructed(0xa0, signedData))
-  if (template) bytes.hapTemplate = { ski, ber, wrongSigner, attributes, wrongAttrDigest, wrongContentType, multipleSigners, identity, digestName }
+  if (template) bytes.hapTemplate = { ski, ber, wrongSigner, attributes, wrongAttrDigest, wrongContentType, multipleSigners, identity, digestName, pss }
   return bytes
 }
 
@@ -168,7 +200,9 @@ function zip(entries, { blocks = [signature()], version = 3, comment = '' } = {}
   const signatureTemplate = blocks.find(item => item.type === 0x20000000 && item.data.hapTemplate)?.data.hapTemplate
   const digestName = signatureTemplate?.digestName ?? 'sha256'
   const digestLength = [32, 48, 64][digestIndex(digestName)]
-  const digestAlgorithm = ((signatureTemplate?.identity.family ?? 'ECC') === 'ECC' ? 0x201 : 0x104) + digestIndex(digestName)
+  const digestBase = (signatureTemplate?.identity.family ?? 'ECC') === 'ECC' ? 0x201 :
+    signatureTemplate?.pss && !signatureTemplate.pss.hapPkcs1 ? 0x101 : 0x104
+  const digestAlgorithm = digestBase + digestIndex(digestName)
   const chunks = []
   for (const section of [Buffer.concat(locals), directory, Buffer.concat([ending, commentBytes])]) {
     for (let at = 0; at < section.length; at += 1024 * 1024) {
@@ -285,6 +319,51 @@ try {
     badContent[5] ^= 1
     fixture(`${test.name}-tampered-content`, badContent, { packageName: 'com.algorithm.fixture', cert: '' })
   }
+  const pssIdentity = certificate('RSA-PSS HAP signer', 201, { family: 'RSA', modulusLength: 2048 })
+  const pssCert = createHash('sha256').update(pssIdentity.der).digest('hex')
+  const pssCases = [
+    { name: 'pss-sha256', digestName: 'sha256', pss: {}, accepted: true },
+    { name: 'pss-sha384', digestName: 'sha384', pss: {}, accepted: true },
+    { name: 'pss-sha512', digestName: 'sha512', pss: {}, accepted: true },
+    { name: 'pss-zero-salt', pss: { saltLength: 0 }, accepted: true },
+    { name: 'pss-default-salt', pss: { omitSalt: true }, accepted: true },
+    { name: 'pss-maximum-salt', pss: { saltLength: 222 }, accepted: true },
+    { name: 'pss-explicit-trailer', pss: { trailer: 1 }, accepted: true },
+    { name: 'pss-no-attributes', pss: {}, accepted: true, attributes: false },
+    { name: 'pss-salt-mismatch', pss: { saltLength: 20, actualSaltLength: 32 }, accepted: false },
+    { name: 'pss-negative-salt', pss: { negativeSalt: true, actualSaltLength: 32 }, accepted: false },
+    { name: 'pss-excessive-salt', pss: { saltLength: 223, actualSaltLength: 32 }, accepted: false },
+    { name: 'pss-sha1-hash', pss: { hashName: 'sha1' }, accepted: false },
+    { name: 'pss-sha384-hash-mismatch', pss: { hashName: 'sha384' }, accepted: false },
+    { name: 'pss-missing-hash', pss: { omitHash: true }, accepted: false },
+    { name: 'pss-missing-mgf', pss: { omitMgf: true }, accepted: false },
+    { name: 'pss-mgf-hash-mismatch', pss: { mgfHash: 'sha384' }, accepted: false },
+    { name: 'pss-wrong-mgf', pss: { mgfOid: '2a864886f70d010101' }, accepted: false },
+    { name: 'pss-wrong-trailer', pss: { trailer: 2 }, accepted: false },
+    { name: 'pss-duplicate-parameters', pss: { duplicateHash: true }, accepted: false },
+    { name: 'pss-unordered-parameters', pss: { reverseParameters: true }, accepted: false },
+    { name: 'pss-null-parameters', pss: { nullParameters: true }, accepted: false },
+    { name: 'pss-missing-parameters', pss: { missingParameters: true }, accepted: false },
+    { name: 'pss-hap-pkcs1-cms', pss: { pkcs1Identifier: true, pkcs1Signature: true }, accepted: false },
+    { name: 'pkcs1-hap-pss-cms', pss: { hapPkcs1: true }, accepted: false },
+    { name: 'pss-padding-mismatch', pss: { pkcs1Signature: true }, accepted: false }
+  ]
+  for (const test of pssCases) {
+    const bytes = zip([{ name: 'module.json', data: configuration('com.algorithm.fixture') }], {
+      blocks: [signature(cms({ identity: pssIdentity, digestName: test.digestName ?? 'sha256',
+        attributes: test.attributes ?? true, pss: test.pss }))]
+    })
+    fixture(test.name, bytes, { packageName: 'com.algorithm.fixture', cert: test.accepted ? pssCert : '' })
+    if (test.accepted) {
+      const changed = Buffer.from(bytes)
+      const central = changed.readUInt32LE(changed.length - 6)
+      changed[central - 33] ^= 1
+      fixture(test.name + '-tampered-signature', changed, { packageName: 'com.algorithm.fixture', cert: '' })
+      const changedContent = Buffer.from(bytes)
+      changedContent[5] ^= 1
+      fixture(test.name + '-tampered-content', changedContent, { packageName: 'com.algorithm.fixture', cert: '' })
+    }
+  }
   // A stored resource forces the first ZIP region across the 1 MiB digest boundary.
   const largeSigned = zip([
     { name: 'module.json', data: configuration('com.algorithm.fixture') },
@@ -391,21 +470,33 @@ export default {
 };
 `)
   writeFileSync(join(directory, 'crypto-sdk.mjs'), `
-import { createHash, createPublicKey, verify } from 'node:crypto';
+import { createHash, createPublicKey, verify, constants } from 'node:crypto';
 let verifyAvailable = true;
 export function setVerifyAvailable(value) { verifyAvailable = value; }
 export default {
+  SignSpecItem: { PSS_SALT_LEN_NUM: 103 },
   createMd(name) { const hash = createHash(name.toLowerCase()); return {
     updateSync(input) { hash.update(input.data); }, digestSync() { return { data: new Uint8Array(hash.digest()) }; }
   }; },
   createAsyKeyGenerator(name) { return { convertKeySync(pub) {
     return { pubKey: createPublicKey({ key: Buffer.from(pub.data), format: 'der', type: 'spki' }) };
   } }; },
-  createVerify(name) { if (!verifyAvailable) throw new Error('verification unavailable'); let key; return {
-    initSync(pub) { key = pub; },
-    verifySync(data, signature) { return verify(name.match(/SHA(?:256|384|512)/)[0].toLowerCase(),
-      data.data, key, signature.data); }
-  }; }
+  createVerify(name) {
+    if (!verifyAvailable) throw new Error('verification unavailable');
+    let key; let saltLength;
+    return {
+      initSync(pub) { key = pub; },
+      setVerifySpec(item, value) { if (item !== 103) throw new Error('unexpected verify parameter'); saltLength = value; },
+      verifySync(data, signature) {
+        const hash = name.match(/SHA(?:256|384|512)/)[0].toLowerCase();
+        const isPss = name.includes('|PSS|');
+        if (isPss && saltLength === undefined) throw new Error('PSS salt length was not set');
+        if (isPss && !name.endsWith('|MGF1_' + hash.toUpperCase())) throw new Error('PSS MGF1 was not set explicitly');
+        const publicKey = isPss ? { key, padding: constants.RSA_PKCS1_PSS_PADDING, saltLength } : key;
+        return verify(hash, data.data, publicKey, signature.data);
+      }
+    };
+  }
 };
 `)
   writeFileSync(join(directory, 'hilog-sdk.mjs'), 'export const hilog = {info(){},warn(){},error(){}};\n')
