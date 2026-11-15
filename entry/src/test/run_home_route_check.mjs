@@ -27,7 +27,8 @@ if (!/pushPathByName\(route, params\)/.test(indexCode) || /pushPathByName\(\s*(\
 if (!/routeMap\(route: string, param: Object\)/.test(indexCode) || !/routeParams\(param\)/.test(indexCode)) {
   problems.push('routeMap 同时接收路由名和 params')
 }
-for (const route of ['home', 'exam', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about']) {
+for (const route of ['home', 'exam', 'malware', 'job', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device',
+  'about']) {
   if (!indexCode.includes(`route === '${route}'`)) {
     problems.push(`routeMap 没有登记 ${route}`)
   }
@@ -35,8 +36,7 @@ for (const route of ['home', 'exam', 'P1', 'P2', 'P3', 'ledger', 'report', 'arch
 if (!/PENDING_ROUTES\.indexOf\(route\) >= 0\)\s*\{\s*pendingPage\(\)/.test(indexCode)) {
   problems.push('占位路由只放占位 builder')
 }
-for (const page of ['MalwareView', 'CleanView', 'PermissionView', 'AppsView', 'ProtectView', 'QuarantineView',
-  'JobResultView']) {
+for (const page of ['CleanView', 'PermissionView', 'AppsView', 'ProtectView', 'QuarantineView']) {
   if (existsSync(resolve(root, `entry/src/main/ets/pages/${page}.ets`)) || indexCode.includes(page)) {
     problems.push(`本 issue 不新建 ${page}`)
   }

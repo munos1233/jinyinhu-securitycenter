@@ -4,17 +4,19 @@ import { ArchiveView } from './ArchiveView';
 import { DeviceView } from './DeviceView';
 import { ExamView } from './ExamView';
 import { HomeView } from './HomeView';
+import { JobResultView } from './JobResultView';
 import { LedgerView } from './LedgerView';
+import { MalwareView } from './MalwareView';
 import { ScanView } from './ScanView';
 import { SocView } from './SocView';
 
 /** 已有页面的路由。 */
 export const PAGE_ROUTES: string[] = [
-  'home', 'exam', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about'
+  'home', 'exam', 'malware', 'job', 'P1', 'P2', 'P3', 'ledger', 'report', 'archive', 'device', 'about'
 ];
 /** 页面由后续 issue 落地，现在只有占位。 */
 export const PENDING_ROUTES: string[] = [
-  'malware', 'clean', 'permission', 'apps', 'protect', 'quarantine', 'job'
+  'clean', 'permission', 'apps', 'protect', 'quarantine'
 ];
 
 @Entry
@@ -59,6 +61,15 @@ struct Index {
             this.open(next, params);
           }
         })
+      } else if (route === 'malware') {
+        MalwareView({
+          params: routeParams(param),
+          onOpen: (next: string, params: string) => {
+            this.open(next, params);
+          }
+        })
+      } else if (route === 'job') {
+        JobResultView({ jobId: routeParams(param) })
       } else if (route === 'P1' || route === 'P2' || route === 'P3') {
         ScanView({ only: route })
       } else if (route === 'ledger') {
