@@ -60,12 +60,19 @@ export class RunnerTable {
   }
 }
 
+/** task 不 import feature。EntryAbility 组装好 Runner 再交进来。 */
+export class RunnerSet {
+  exam: ExamRun | null = null
+}
+
 export class RunnerRegistry {
   private static current: RunnerTable = new RunnerTable()
 
-  /** EntryAbility 调用一次。本轮还没有任何 Runner，表是空的。 */
-  static registerAll(): void {
-    RunnerRegistry.current = new RunnerTable()
+  /** EntryAbility 调用一次。本轮只登记 exam，其余种类仍是空的。 */
+  static registerAll(runners: RunnerSet = new RunnerSet()): void {
+    let table = new RunnerTable()
+    table.exam = runners.exam
+    RunnerRegistry.current = table
   }
 
   static table(): RunnerTable {
