@@ -64,16 +64,22 @@ export class RunnerTable {
 export class RunnerSet {
   exam: ExamRun | null = null
   malware: MalwareRun | null = null
+  clean: CleanRun | null = null
+  duplicate: FileToolRun | null = null
+  largeFile: FileToolRun | null = null
 }
 
 export class RunnerRegistry {
   private static current: RunnerTable = new RunnerTable()
 
-  /** EntryAbility 调用一次。本轮登记 exam 和 malware，其余种类仍是空的。 */
+  /** EntryAbility 调用一次。本轮登记 exam、malware、clean、duplicate、large-file，其余种类仍是空的。 */
   static registerAll(runners: RunnerSet = new RunnerSet()): void {
     let table = new RunnerTable()
     table.exam = runners.exam
     table.malware = runners.malware
+    table.clean = runners.clean
+    table.duplicate = runners.duplicate
+    table.largeFile = runners.largeFile
     RunnerRegistry.current = table
   }
 
