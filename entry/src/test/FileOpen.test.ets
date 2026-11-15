@@ -208,6 +208,10 @@ export function runFileOpenChecks(): void {
   if (!(link instanceof CenterError) || link.code !== 'rejected-system-path') {
     fail('符号链接在设备打开时被当成了普通文件')
   }
+  let ancestor = device.accept('/storage/users/link/subdir/sample.hap', '/storage/users/link/subdir')
+  if (!(ancestor instanceof CenterError) || ancestor.code !== 'rejected-system-path') {
+    fail('授权根之前的祖先符号链接没有在打开前拒绝')
+  }
   let outside = device.accept('/storage/users/../../etc/passwd', '/storage/users')
   if (!(outside instanceof CenterError)) {
     fail('折出文件系统根的路径被允许了')

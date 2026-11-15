@@ -4,6 +4,8 @@ import { picker } from '@kit.CoreFileKit';
 import { util } from '@kit.ArkTS';
 import { hilog } from '@kit.PerformanceAnalysisKit';
 import { Theme } from '../common/Theme';
+import type { CheckStatus } from '../center/CenterTypes';
+import { toCheck } from '../center/ProbeMap';
 import { BusyStage, DemoBadge, EvidenceSheet, GhostButton, PrimaryButton, QuietStage } from '../components/UiParts';
 import { LiveStore, ScanProgress } from '../model/LiveStore';
 import { PROBE_IDS, probeName } from '../model/ProbeStatus';
@@ -158,6 +160,14 @@ export struct ScanView {
         .maxLines(2)
         .textOverflow({ overflow: TextOverflow.Ellipsis })
         .margin({ top: 12 })
+
+      if (this.showingRun(id) && this.phraseDetail(id).length > 0) {
+        Text(this.phraseDetail(id))
+          .width('100%')
+          .fontSize(14)
+          .fontColor(Theme.muted)
+          .margin({ top: 8 })
+      }
 
       if (!this.showingRun(id) && !this.scanningThis(id)) {
         Text(this.visibleFault(id) !== undefined ? this.faultText(id) : this.emptyHint(id))
@@ -676,12 +686,27 @@ export struct ScanView {
     }
     let run = this.visibleRun(id);
     if (run !== undefined) {
-      return run.phrase;
+      let status = this.checkStatus(id);
+      if (status === 'risk') {
+        return '风险';
+      }
+      if (status === 'ok') {
+        return '通过';
+      }
+      return '未验证';
     }
     if (this.visibleFault(id) !== undefined) {
       return '检测未完成';
     }
     return '尚未检测';
+  }
+
+  private checkStatus(id: string): CheckStatus {
+    return toCheck(id, this.visibleRun(id)).status;
+  }
+
+  private phraseDetail(id: string): string {
+    return toCheck(id, this.visibleRun(id)).detail;
   }
 
   private phraseColor(id: string): string {
@@ -695,10 +720,11 @@ export struct ScanView {
       }
       return Theme.muted;
     }
-    if (run.verdict === 'hit') {
+    let status = this.checkStatus(id);
+    if (status === 'risk') {
       return Theme.danger;
     }
-    if (run.verdict === 'blocked') {
+    if (status === 'ok') {
       return Theme.ok;
     }
     return Theme.accent;
@@ -715,16 +741,14 @@ export struct ScanView {
       }
       return Theme.line;
     }
-    if (run.verdict === 'hit') {
+    let status = this.checkStatus(id);
+    if (status === 'risk') {
       return Theme.danger;
     }
-    if (run.verdict === 'blocked') {
+    if (status === 'ok') {
       return Theme.ok;
     }
-    if (run.verdict === 'passive') {
-      return Theme.accent;
-    }
-    return Theme.line;
+    return Theme.accent;
   }
 
   private runEvidences(id: string): ProbeEvidence[] {
