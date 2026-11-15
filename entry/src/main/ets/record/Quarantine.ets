@@ -276,6 +276,30 @@ export class Quarantine {
     }
   }
 
+  list(): QuarantineEntry[] | null {
+    return Writer.exclusive(() => {
+      return this.readManifest()
+    })
+  }
+
+  /** 去掉清单和密文。不删除 from 指向的原文件。 */
+  discard(id: string): CenterError | null {
+    let found = Writer.exclusive(() => {
+      return this.find(id)
+    })
+    if (found === null) {
+      return this.error('io', id)
+    }
+    let removed = Writer.exclusive(() => {
+      return this.removeEntry(id)
+    })
+    if (!removed) {
+      return this.error('io', MANIFEST)
+    }
+    this.bytes.remove(BLOB_DIR + found.stored)
+    return null
+  }
+
   private quotaState(size: number): number {
     let rows = this.readManifest()
     if (rows === null) {

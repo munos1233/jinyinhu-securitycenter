@@ -408,4 +408,31 @@ export function runQuarantineChecks(): void {
     rows(files3).length !== 0) {
     fail('源文件已经删除后没有写回原路径')
   }
+
+  let files4 = new MemoryFiles()
+  let bytes4 = new MemoryBytes()
+  let view4 = new MapView()
+  let cipher4 = new FakeCipher()
+  bytes4.values.set(FROM, plain)
+  let box4 = box(files4, bytes4, view4, cipher4)
+  bytes4.failRemove = FROM
+  let pending = box4.put(FROM, plain.length, '', '安装包', ROOT, true)
+  bytes4.failRemove = ''
+  if (pending instanceof CenterError || pending.committed) {
+    fail('删除测试前没有留下未完成条目')
+    return
+  }
+  let shown = box4.list()
+  if (shown === null || shown.length !== 1 || shown[0].committed || shown[0].from !== FROM) {
+    fail('隔离区列表没有读出未完成条目')
+  }
+  let dropped = box4.discard(pending.id)
+  if (dropped !== null || rows(files4).length !== 0 || bytes4.values.has(FROM) !== true ||
+    bytes4.values.has('center/quarantine/blobs/' + ID) === true) {
+    fail('删除隔离项时删了原文件，或没有去掉清单和密文')
+  }
+  files4.write(MANIFEST, '{')
+  if (box4.list() !== null) {
+    fail('坏清单被显示成空的隔离区')
+  }
 }
