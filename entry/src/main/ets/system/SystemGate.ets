@@ -53,6 +53,11 @@ export interface GateProbes {
   huks(): Promise<Gate>
 }
 
+/** 端口调用时被系统拒绝，把对应 Gate 记成 unsupported。下一次 probe() 重新探测。 */
+export interface GateRefusal {
+  refuse(id: 'grants' | 'revoke', reason: string): void
+}
+
 export class GateValue implements Gate {
   id: string = ''
   status: GateStatus = 'unsupported'
@@ -91,7 +96,7 @@ class GateSet {
   huks: Gate = gateOf('huks', 'unsupported', 'not-probed')
 }
 
-export class ProbedGate implements SystemGate {
+export class ProbedGate implements SystemGate, GateRefusal {
   private probes: GateProbes
   private now: () => number
   private current: GateSet = new GateSet()
@@ -182,6 +187,15 @@ export class ProbedGate implements SystemGate {
   invalidate(): void {
     this.generation++
     this.probedAt = -1
+  }
+
+  refuse(id: 'grants' | 'revoke', reason: string): void {
+    hilog.warn(DOMAIN, TAG, 'gate %{public}s refused: %{public}s', id, reason)
+    if (id === 'grants') {
+      this.current.grants = gateOf('grants', 'unsupported', reason)
+    } else {
+      this.current.revoke = gateOf('revoke', 'unsupported', reason)
+    }
   }
 
   stale(): boolean {
