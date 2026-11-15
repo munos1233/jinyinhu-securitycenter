@@ -4,15 +4,13 @@ import { hilog } from '@kit.PerformanceAnalysisKit'
 import type { CertAlgo, HapMeta } from '../center/CenterTypes'
 import { hashChunk, hapReadMax, hapEntryMax } from '../center/CenterLimits'
 import { BundleFinger, digestHex } from './BundleFinger'
+import { verifiedHapCertificate } from './HapSignature'
 
 const DOMAIN: number = 0x4A59
 const TAG: string = 'Center'
 const EOCD: number = 0x06054b50
 const CENTRAL: number = 0x02014b50
 const LOCAL: number = 0x04034b50
-const SIGNED_DATA_OID: string = '2a864886f70d010702'
-// The official HAP v2/v3 parser uses HapSigningBlockUtils::MAX_BLOCK_COUNT = 10.
-const MAX_SIGNING_BLOCKS: number = 10
 
 export class HapReadResult implements HapMeta {
   bundleName: string = ''
@@ -123,8 +121,26 @@ export class HapReader {
       if (result.size > hapReadMax || stopped()) {
         return result
       }
+      // Parse and verify one immutable snapshot. Re-reading a mutable fd for
+      // configuration and signing data can mix metadata from different contents.
+      let snapshot = new Uint8Array(result.size)
+      for (let offset = 0; offset < result.size; offset += hashChunk) {
+        if (stopped()) {
+          return result
+        }
+        let length = Math.min(hashChunk, result.size - offset)
+        let part = this.io.readAt(fd, offset, length)
+        if (part.length !== length) {
+          return result
+        }
+        snapshot.set(part, offset)
+      }
+      let io = new SnapshotHapIo(snapshot)
+      if (result.sha256.length > 0 && io.hash(0, result.size, stopped) !== result.sha256) {
+        return result
+      }
       let tailOffset = Math.max(0, result.size - 65557)
-      let tail = this.io.readAt(fd, tailOffset, result.size - tailOffset)
+      let tail = io.readAt(0, tailOffset, result.size - tailOffset)
       let eocd = findEocd(tail)
       let centralSize = u32(tail, eocd + 12)
       let centralOffset = u32(tail, eocd + 16)
@@ -134,15 +150,20 @@ export class HapReader {
         return result
       }
       try {
-        this.readConfig(fd, centralOffset, centralSize, 'module.json', result, stopped)
+        this.readConfig(io, 0, centralOffset, centralSize, 'module.json', result, stopped)
         if (result.bundleName.length === 0 && !stopped()) {
-          this.readConfig(fd, centralOffset, centralSize, 'config.json', result, stopped)
+          this.readConfig(io, 0, centralOffset, centralSize, 'config.json', result, stopped)
         }
       } catch (err) {
         hilog.warn(DOMAIN, TAG, 'HAP configuration unavailable')
       }
-      if (!stopped()) {
-        this.readCertificate(fd, centralOffset, result)
+      if (result.sha256.length > 0 && !stopped()) {
+        let certificate = verifiedHapCertificate(snapshot, centralOffset, tailOffset + eocd, stopped)
+        if (!stopped()) {
+          let fingerprint = BundleFinger.read('', certificate)
+          result.certSha256 = fingerprint.certSha256
+          result.certAlgo = fingerprint.certAlgo
+        }
       }
     } catch (err) {
       hilog.warn(DOMAIN, TAG, 'HAP metadata unavailable')
@@ -150,14 +171,14 @@ export class HapReader {
     return result
   }
 
-  private readConfig(fd: number, central: number, length: number, configName: string, result: HapReadResult,
+  private readConfig(io: HapIo, fd: number, central: number, length: number, configName: string, result: HapReadResult,
     stopped: () => boolean): void {
     let end = central + length
     for (let cursor = central; cursor < end && !stopped();) {
       if (end - cursor < 46) {
         return
       }
-      let header = this.io.readAt(fd, cursor, 46)
+      let header = io.readAt(fd, cursor, 46)
       if (u32(header, 0) !== CENTRAL) {
         return
       }
@@ -166,7 +187,7 @@ export class HapReader {
       if (next > end) {
         return
       }
-      let nameBytes = this.io.readAt(fd, cursor + 46, nameLength)
+      let nameBytes = io.readAt(fd, cursor + 46, nameLength)
       cursor = next
       let name = ''
       try {
@@ -186,7 +207,7 @@ export class HapReader {
       entry.unpacked = u32(header, 24)
       entry.offset = u32(header, 42)
       try {
-        let data = this.readEntry(fd, entry, central, stopped)
+        let data = this.readEntry(io, fd, entry, central, stopped)
         if (data !== null && applyConfig(data, configName === 'config.json', result)) {
           return
         }
@@ -196,7 +217,7 @@ export class HapReader {
     }
   }
 
-  private readEntry(fd: number, entry: ZipEntry, central: number,
+  private readEntry(io: HapIo, fd: number, entry: ZipEntry, central: number,
     stopped: () => boolean): Uint8Array | null {
     if ((entry.flags & 1) !== 0 || entry.unpacked > hapEntryMax ||
       entry.compressed > hapReadMax || (entry.method === 0 && entry.compressed !== entry.unpacked) ||
@@ -204,7 +225,7 @@ export class HapReader {
       (entry.method !== 0 && entry.method !== 8)) {
       return null
     }
-    let header = this.io.readAt(fd, entry.offset, 30)
+    let header = io.readAt(fd, entry.offset, 30)
     if (u32(header, 0) !== LOCAL || u16(header, 8) !== entry.method ||
       u16(header, 6) !== entry.flags) {
       return null
@@ -212,54 +233,17 @@ export class HapReader {
     let nameLength = u16(header, 26)
     let dataOffset = entry.offset + 30 + nameLength + u16(header, 28)
     if (dataOffset + entry.compressed > central ||
-      utf8(this.io.readAt(fd, entry.offset + 30, nameLength)) !== entry.name) {
+      utf8(io.readAt(fd, entry.offset + 30, nameLength)) !== entry.name) {
       return null
     }
-    let data = entry.method === 0 ? this.io.readAt(fd, dataOffset, entry.compressed) :
-      inflateRaw(this.io, fd, dataOffset, entry.compressed, entry.unpacked, stopped)
+    let data = entry.method === 0 ? io.readAt(fd, dataOffset, entry.compressed) :
+      inflateRaw(io, fd, dataOffset, entry.compressed, entry.unpacked, stopped)
     if (data.length !== entry.unpacked || data.length > hapEntryMax || crc32(data) !== entry.crc) {
       return null
     }
     return data
   }
 
-  private readCertificate(fd: number, central: number, result: HapReadResult): void {
-    if (central < 32) {
-      return
-    }
-    let footer = this.io.readAt(fd, central - 32, 32)
-    let count = u32(footer, 0)
-    let size = u32(footer, 4) + u32(footer, 8) * 4294967296
-    let version = u32(footer, 28)
-    let magic = utf8(footer.subarray(12, 28))
-    if (count === 0 || count > MAX_SIGNING_BLOCKS || size < 32 + count * 12 || size > central ||
-      magic !== (version < 3 ? 'HAP Sig Block 42' : '<hap sign block>')) {
-      return
-    }
-    let start = central - size
-    let table = this.io.readAt(fd, start, count * 12)
-    let certificate = new Uint8Array(0)
-    let found = false
-    for (let i = 0; i < count; i++) {
-      let at = i * 12
-      let type = u32(table, at)
-      let length = u32(table, at + 4)
-      let offset = u32(table, at + 8)
-      if (offset < table.length || offset + length > size - 32) {
-        return
-      }
-      if (type === 0x20000000) {
-        if (found || length > hapEntryMax) {
-          return
-        }
-        found = true
-        certificate = signerCertificate(this.io.readAt(fd, start + offset, length))
-      }
-    }
-    let fingerprint = BundleFinger.read('', certificate)
-    result.certSha256 = fingerprint.certSha256
-    result.certAlgo = fingerprint.certAlgo
-  }
 }
 
 function applyConfig(bytes: Uint8Array, legacy: boolean, result: HapReadResult): boolean {
@@ -564,171 +548,32 @@ function inflateRaw(io: HapIo, fd: number, offset: number, length: number,
   return output
 }
 
-class AsnNode {
-  tag: number = 0
-  start: number = 0
-  content: number = 0
-  contentEnd: number = 0
-  end: number = 0
-}
+class SnapshotHapIo implements HapIo {
+  private bytes: Uint8Array
 
-function asnNode(bytes: Uint8Array, start: number, limit: number, depth: number): AsnNode {
-  if (depth > 24 || start + 2 > limit || limit > bytes.length) {
-    throw new Error('invalid ASN.1 bounds')
+  constructor(bytes: Uint8Array) {
+    this.bytes = bytes
   }
-  let node = new AsnNode()
-  node.start = start
-  node.tag = bytes[start++]
-  if ((node.tag & 31) === 31) {
-    throw new Error('unsupported ASN.1 tag')
-  }
-  let length = bytes[start++]
-  if (length === 0x80) {
-    if ((node.tag & 0x20) === 0) {
-      throw new Error('primitive indefinite ASN.1 length')
-    }
-    node.content = start
-    while (start + 2 <= limit && (bytes[start] !== 0 || bytes[start + 1] !== 0)) {
-      start = asnNode(bytes, start, limit, depth + 1).end
-    }
-    if (start + 2 > limit) {
-      throw new Error('unterminated ASN.1 value')
-    }
-    node.contentEnd = start
-    node.end = start + 2
-    return node
-  }
-  if (length > 0x80) {
-    let count = length & 0x7f
-    if (count > 4 || start + count > limit) {
-      throw new Error('invalid ASN.1 length')
-    }
-    length = 0
-    for (let i = 0; i < count; i++) {
-      length = length * 256 + bytes[start++]
-    }
-  }
-  node.content = start
-  node.contentEnd = start + length
-  node.end = node.contentEnd
-  if (node.end > limit) {
-    throw new Error('ASN.1 length exceeds input')
-  }
-  return node
-}
 
-function children(bytes: Uint8Array, parent: AsnNode): AsnNode[] {
-  let nodes: AsnNode[] = []
-  for (let at = parent.content; at < parent.contentEnd;) {
-    let node = asnNode(bytes, at, parent.contentEnd, 0)
-    nodes.push(node)
-    at = node.end
+  size(fd: number): number {
+    return this.bytes.length
   }
-  return nodes
-}
 
-function sameBytes(a: Uint8Array, b: Uint8Array): boolean {
-  if (a.length !== b.length) {
-    return false
-  }
-  for (let i = 0; i < a.length; i++) {
-    if (a[i] !== b[i]) {
-      return false
+  readAt(fd: number, offset: number, length: number): Uint8Array {
+    if (offset < 0 || length < 0 || offset + length > this.bytes.length) {
+      throw new Error('snapshot read out of bounds')
     }
+    return this.bytes.subarray(offset, offset + length)
   }
-  return true
-}
 
-function integerBytes(bytes: Uint8Array, node: AsnNode): Uint8Array {
-  let start = node.content
-  while (start + 1 < node.contentEnd && bytes[start] === 0) {
-    start++
-  }
-  return bytes.subarray(start, node.contentEnd)
-}
-
-function matchesSigner(bytes: Uint8Array, certificate: AsnNode, sid: AsnNode): boolean {
-  let certFields = children(bytes, certificate)
-  if (certFields.length !== 3 || certFields[0].tag !== 0x30) {
-    return false
-  }
-  let tbs = children(bytes, certFields[0])
-  let serial = tbs.length > 0 && tbs[0].tag === 0xa0 ? 1 : 0
-  if (tbs.length <= serial + 5 || tbs[serial].tag !== 2) {
-    return false
-  }
-  if (sid.tag === 0x30) {
-    let issuerSerial = children(bytes, sid)
-    return issuerSerial.length === 2 && issuerSerial[1].tag === 2 &&
-      sameBytes(bytes.subarray(tbs[serial + 2].start, tbs[serial + 2].end),
-        bytes.subarray(issuerSerial[0].start, issuerSerial[0].end)) &&
-      sameBytes(integerBytes(bytes, tbs[serial]), integerBytes(bytes, issuerSerial[1]))
-  }
-  if (sid.tag === 0x80) {
-    for (let field of tbs) {
-      if (field.tag !== 0xa3) {
-        continue
+  hash(fd: number, size: number, stopped: () => boolean): string {
+    let digest = cryptoFramework.createMd('SHA256')
+    for (let offset = 0; offset < size; offset += hashChunk) {
+      if (stopped()) {
+        return ''
       }
-      let wrapper = children(bytes, field)
-      if (wrapper.length !== 1 || wrapper[0].tag !== 0x30) {
-        return false
-      }
-      for (let extension of children(bytes, wrapper[0])) {
-        let values = children(bytes, extension)
-        if (values.length >= 2 && values[0].tag === 6 &&
-          digestHex(bytes.subarray(values[0].content, values[0].contentEnd)) === '551d0e') {
-          let octets = values[values.length - 1]
-          let key = asnNode(bytes, octets.content, octets.contentEnd, 0)
-          return octets.tag === 4 && key.tag === 4 && key.end === octets.contentEnd &&
-            sameBytes(bytes.subarray(key.content, key.contentEnd), bytes.subarray(sid.content, sid.contentEnd))
-        }
-      }
+      digest.updateSync({ data: this.bytes.subarray(offset, Math.min(size, offset + hashChunk)) })
     }
+    return stopped() ? '' : digestHex(digest.digestSync().data)
   }
-  return false
-}
-
-function signerCertificate(bytes: Uint8Array): Uint8Array {
-  let empty = new Uint8Array(0)
-  let root = asnNode(bytes, 0, bytes.length, 0)
-  if (root.tag !== 0x30 || root.end !== bytes.length) {
-    return empty
-  }
-  let content = children(bytes, root)
-  if (content.length !== 2 || content[0].tag !== 6 || content[1].tag !== 0xa0 ||
-    digestHex(bytes.subarray(content[0].content, content[0].contentEnd)) !== SIGNED_DATA_OID) {
-    return empty
-  }
-  let wrapper = children(bytes, content[1])
-  if (wrapper.length !== 1 || wrapper[0].tag !== 0x30) {
-    return empty
-  }
-  let signed = children(bytes, wrapper[0])
-  if (signed.length < 4 || signed[0].tag !== 2 || signed[1].tag !== 0x31 || signed[2].tag !== 0x30) {
-    return empty
-  }
-  let certificates: AsnNode[] = []
-  for (let i = 3; i < signed.length - 1; i++) {
-    if (signed[i].tag === 0xa0) {
-      certificates = children(bytes, signed[i])
-    }
-  }
-  let signerSet = signed[signed.length - 1]
-  if (signerSet.tag !== 0x31) {
-    return empty
-  }
-  let signers = children(bytes, signerSet)
-  if (signers.length === 0 || signers[0].tag !== 0x30) {
-    return empty
-  }
-  let signer = children(bytes, signers[0])
-  if (signer.length < 5 || signer[0].tag !== 2) {
-    return empty
-  }
-  for (let certificate of certificates) {
-    if (certificate.tag === 0x30 && matchesSigner(bytes, certificate, signer[1])) {
-      return bytes.slice(certificate.start, certificate.end)
-    }
-  }
-  return empty
 }

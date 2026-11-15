@@ -1,7 +1,9 @@
 import fs from '@ohos.file.fs'
-import type { FileGrant, FileSource, HapMeta } from '../main/ets/center/CenterTypes'
+import type { FileGrant, FileSource, HapMeta, Fingerprint } from '../main/ets/center/CenterTypes'
 import { hapReadMax } from '../main/ets/center/CenterLimits'
 import { CenterError } from '../main/ets/center/CenterError'
+import { decide } from '../main/ets/engine/Decide'
+import { RuleLoad, OfficialRule } from '../main/ets/engine/RulePack'
 import { BundleFinger } from '../main/ets/engine/BundleFinger'
 import { FsHapIo, HapReader } from '../main/ets/engine/HapReader'
 import { FsInstallerIo, InstallerScanner, listInstallers } from '../main/ets/engine/InstallerScan'
@@ -54,6 +56,22 @@ class OversizedIo extends FsHapIo {
 class HashFailureIo extends FsHapIo {
   hash(fd: number, size: number, stopped: () => boolean): string {
     throw new Error('hash unavailable')
+  }
+}
+
+class ChangingIo extends FsHapIo {
+  readAt(fd: number, offset: number, length: number): Uint8Array {
+    let part = super.readAt(fd, offset, length)
+    if (offset === 0 && length > 5) {
+      part[5] ^= 1
+    }
+    return part
+  }
+
+  hash(fd: number, size: number, stopped: () => boolean): string {
+    // Keep the initial hash consistent with the original file, then change the
+    // snapshot read. The reader must reject metadata from a different version.
+    return new FsHapIo().hash(fd, size, stopped)
   }
 }
 
@@ -168,6 +186,13 @@ function checkBundleFinger(): void {
 
 function checkFixtures(fixtures: HapFixture[]): void {
   let reader = new HapReader()
+  let rules = new RuleLoad()
+  let official = new OfficialRule()
+  official.bundleName = 'com.test.fixture'
+  official.certAlgo = 'sha256-of-cert-bytes'
+  official.certSha256 = fixtures.filter((item: HapFixture): boolean => item.name === 'stored')
+    .map((item: HapFixture): string => item.certSha256)
+  rules.officials = [official]
   for (let fixture of fixtures) {
     let result = openedRead(reader, fixture.path)
     require(result.sha256 === fixture.sha256, fixture.name + ': file SHA-256 must survive metadata failures ' +
@@ -176,10 +201,23 @@ function checkFixtures(fixtures: HapFixture[]): void {
       result.versionCode === fixture.versionCode, fixture.name + ': actual module.json fields must be decoded')
     require(result.certSha256 === fixture.certSha256 &&
       result.certAlgo === (fixture.certSha256.length > 0 ? 'sha256-of-cert-bytes' : 'none'),
-      fixture.name + ': the selected CMS signer certificate must be hashed')
+      fixture.name + ': only a verified HAP signer certificate can supply identity')
     require(JSON.stringify(result.declaredPermissions) === JSON.stringify(fixture.declaredPermissions),
       fixture.name + ': declared permission names must be preserved')
+    if (result.bundleName === official.bundleName) {
+      let fp: Fingerprint = { kind: 'file', id: fixture.path, bundleName: result.bundleName,
+        version: result.version, versionCode: result.versionCode, certSha256: result.certSha256,
+        certAlgo: result.certAlgo, sha256: result.sha256, size: result.size, label: '' }
+      let verdict = decide(fp, result.declaredPermissions, [], false, rules, [],
+        { state: 'reached', level: 'ok', reason: '', evidence: '' })
+      require(fixture.certSha256.length > 0 ? verdict.evidence === 'official' : verdict.level === 'unknown',
+        fixture.name + ': unverified certificate material must not produce official or cloud-ok identity')
+    }
   }
+  let changed = openedRead(new HapReader(new ChangingIo()), fixtures.filter(
+    (item: HapFixture): boolean => item.name === 'stored')[0].path)
+  require(changed.bundleName === '' && changed.certSha256 === '' && changed.certAlgo === 'none',
+    'a source that changes between hashing and snapshotting must not supply mixed metadata')
   let oversized = new OversizedIo()
   let result = new HapReader(oversized).read(0)
   require(result.size === hapReadMax + 1 && result.sha256 === 'large-file-hash' &&
