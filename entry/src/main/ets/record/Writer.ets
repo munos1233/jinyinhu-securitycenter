@@ -4,6 +4,7 @@ import { nowIso } from '../center/Clock';
 import { jobMax, listMax } from '../center/CenterLimits';
 import type {
   CacheRow,
+  CheckItem,
   CleanReport,
   ExamReport,
   ExamState,
@@ -11,7 +12,9 @@ import type {
   FileHit,
   FileToolReport,
   JobRecord,
+  JobKind,
   JobState,
+  Lane,
   PermissionFact,
   ScanHit,
   ScanReport
@@ -41,8 +44,8 @@ class IndexRow implements JobRecord {
   jobId: string = ''
   seq: number = 0
   seqPresent: boolean = false
-  kind: JobRecord['kind'] = 'exam'
-  lane: JobRecord['lane'] = 'heavy'
+  kind: JobKind = 'exam'
+  lane: Lane = 'heavy'
   startedAt: string = ''
   finishedAt: string = ''
   state: JobState = 'done'
@@ -55,7 +58,7 @@ class IndexRow implements JobRecord {
 class ExamStub implements ExamReport {
   jobId: string = ''
   state: ExamState = 'not-run'
-  items: ExamReport['items'] = []
+  items: CheckItem[] = []
   apps: ScanHit[] = []
   appsComplete: boolean = false
   summary: ExamSummary = {
@@ -84,8 +87,8 @@ class Candidate implements HomeCandidate {
 class DiskRecord implements JobRecord {
   jobId: string = ''
   seq: number = 0
-  kind: JobRecord['kind'] = 'exam'
-  lane: JobRecord['lane'] = 'heavy'
+  kind: JobKind = 'exam'
+  lane: Lane = 'heavy'
   startedAt: string = ''
   finishedAt: string = ''
   state: JobState = 'done'

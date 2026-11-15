@@ -17,6 +17,7 @@ import type { HomeCandidate } from '../feature/exam/ExamState'
 import { AuditLog } from './AuditLog'
 import { TrustList } from './TrustList'
 import { Writer } from './Writer'
+import type { PermissionActions } from './PermissionActions'
 
 const DOMAIN: number = 0x4A59
 const TAG: string = 'Center'
@@ -88,9 +89,29 @@ class ExamRow implements HomeCandidate {
 
 export class Disposition {
   private ports: DispositionPorts
+  private permissions: PermissionActions | null = null
 
   constructor(ports: DispositionPorts) {
     this.ports = ports
+  }
+
+  /** 权限端口由组合根在创建后绑定。 */
+  bindPermissions(permissions: PermissionActions): void {
+    this.permissions = permissions
+  }
+
+  /** 用户确认后交给权限操作服务重新读取授权并执行关闭。 */
+  async closePermission(jobId: string, bundleName: string, permission: string,
+    focus: string): Promise<DispositionResult> {
+    if (this.permissions === null) {
+      return refuse(UNSUPPORTED)
+    }
+    let result = await this.permissions.revoke(jobId, bundleName, permission, focus)
+    let out = new DispositionResult()
+    out.done = result.done
+    out.message = result.message
+    out.button = result.done ? '已关闭' : ''
+    return out
   }
 
   /** 信誉、体检或软件结果里的已装应用。 */

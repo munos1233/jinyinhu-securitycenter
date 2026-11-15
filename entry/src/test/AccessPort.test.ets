@@ -468,6 +468,30 @@ async function checkRevoke(): Promise<void> {
   }
 }
 
+async function checkCanRevoke(): Promise<void> {
+  let gate = new StubGate()
+  let source = new FakeSource()
+  let port = new AccessPort(gate, gate, source, (): number => 0)
+  if (await port.canRevoke(0, CAMERA) || source.flagsCalls.length !== 0) {
+    fail('无效 token 不得复核或允许撤权')
+  }
+  if (!(await port.canRevoke(11, CAMERA))) {
+    fail('读取成功且非系统固定时允许复核通过')
+  }
+  source.flags.set('11/' + CAMERA, PERMISSION_SYSTEM_FIXED)
+  if (await port.canRevoke(11, CAMERA)) {
+    fail('系统固定权限不得撤权')
+  }
+  source.flagsError = 12100001
+  if (await port.canRevoke(11, CAMERA) || gate.grants().status !== 'ready') {
+    fail('flag 读取失败须拒绝撤权，并保留普通错误的 Gate 状态')
+  }
+  source.flagsError = 201
+  if (await port.canRevoke(11, CAMERA) || gate.grants().status !== 'unsupported') {
+    fail('flag 被拒须拒绝撤权并标记 grants 不可用')
+  }
+}
+
 async function checkRecentUses(): Promise<void> {
   let clock = new Clock()
   let gate = new StubGate()
@@ -599,6 +623,7 @@ export async function runAccessPortChecks(): Promise<void> {
   await checkGrantsNotReady()
   await checkGrantsRefused()
   await checkRevoke()
+  await checkCanRevoke()
   await checkRecentUses()
   await checkProbedGateRefusal()
 }

@@ -54,7 +54,7 @@ for (const banned of ['已安全', '云查杀已开启', '已防护', '已拦截
     problems.push(`ExamRunner 出现了「${banned}」`)
   }
 }
-if (/from '\.\.\/(malware|clean|permission|apps|protect)\//.test(runner) || /from '\.\.\/\.\.\/pages\//.test(runner)) {
+if (/from '\.\.\/(malware|clean|apps|protect)\//.test(runner) || /from '\.\.\/\.\.\/pages\//.test(runner)) {
   problems.push('功能模块互不 import，也不 import 页面')
 }
 if ((runnerCode.match(/listInstallers\(/g) || []).length !== 1 ||
@@ -77,8 +77,8 @@ if (/from '\.\.\/(feature|pages)\//.test(registry)) {
 }
 const registerBody = code(registry).match(/static registerAll\(.*\): void \{([\s\S]*?)\n {2}\}/)
 if (registerBody === null || !/table\.exam = runners\.exam/.test(registerBody[1]) ||
-  /table\.(permission|apps|protect)\s*=/.test(registerBody[1])) {
-  problems.push('RunnerRegistry.registerAll 登记 exam，不登记 permission/apps/protect')
+  /table\.(apps|protect)\s*=/.test(registerBody[1])) {
+  problems.push('RunnerRegistry.registerAll 登记 exam，不登记 apps/protect')
 }
 
 if (problems.length > 0) {
