@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { centerErrorMessage } from '../center/CenterError'
-import { laneOf } from '../center/CenterLimits'
+import { jobMax, laneOf } from '../center/CenterLimits'
 import type {
   JobKind, JobProgress, JobRecord, JobRequest, JobState, Lane, ScanScope
 } from '../center/CenterTypes'
@@ -103,6 +103,8 @@ export class JobQueue {
   private idOf: JobIdSource
   private light: LaneQueue = new LaneQueue()
   private heavy: LaneQueue = new LaneQueue()
+  private requests: Map<string, QueueRequest> = new Map<string, QueueRequest>()
+  private requestOrder: string[] = []
 
   constructor(runner: JobRunner, gate: SystemGate, clock: Clock, sink: ProgressSink = new AppStorageSink(),
     post: UiPost = postToUi, idOf: JobIdSource = randomJobId) {
@@ -131,6 +133,12 @@ export class JobQueue {
       })
     }
     job.record = this.admit(normal)
+    this.requests.set(job.record.jobId, copyRequest(normal))
+    this.requestOrder.push(job.record.jobId)
+    if (this.requestOrder.length > jobMax) {
+      let oldest = this.requestOrder.shift()
+      if (oldest !== undefined) this.requests.delete(oldest)
+    }
     let lane = this.laneFor(job.record.lane)
     lane.waiting.push(job)
     this.publish(job)
@@ -171,6 +179,12 @@ export class JobQueue {
       return null
     }
     return copyRequest(job.request)
+  }
+
+  /** One-time picker roots remain available only within this process. */
+  requestOf(jobId: string): JobRequest | null {
+    let request = this.requests.get(jobId)
+    return request === undefined ? null : copyRequest(request)
   }
 
   private find(kind: JobKind): Job | null {

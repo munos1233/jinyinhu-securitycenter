@@ -85,15 +85,18 @@ class FakeDoor implements QuarantineDoor {
   calls: string[] = []
   sizes: number[] = []
   fail: CenterError | null = null
+  committed: boolean = true
+  throws: boolean = false
 
-  put(from: string, size: number, sha256: string, reason: string): CenterError | QuarantineEntry {
+  async put(from: string, size: number, sha256: string, reason: string): Promise<CenterError | QuarantineEntry> {
     this.calls.push(from)
     this.sizes.push(size)
+    if (this.throws) throw new Error('unexpected')
     if (this.fail !== null) {
       return this.fail
     }
     return { id: 'q1', from: from, stored: 'q1', sha256: sha256, size: size, iv: '', tag: '', reason: reason,
-      at: '', committed: true }
+      at: '', committed: this.committed }
   }
 }
 
@@ -354,6 +357,22 @@ async function checkQuarantineFromScan(): Promise<void> {
     'action 已不是 none 的行又被隔离了一次')
 }
 
+async function checkQuarantineUncommitted(): Promise<void> {
+  let setup = main()
+  let beforeScan = text(setup, 'm-1')
+  let beforeExam = text(setup, 'e-done')
+  setup.door.committed = false
+  let result = await setup.disposition.quarantine('m-1', FILE_F)
+  require(!result.done && result.message === '副本已保存，原文件仍在', '未删除原文件时不得报告处置成功')
+  require(text(setup, 'm-1') === beforeScan && text(setup, 'e-done') === beforeExam,
+    '未完成的隔离不得修改扫描或体检结果')
+  setup.door.throws = true
+  let failed = await setup.disposition.quarantine('m-1', FILE_F)
+  require(!failed.done && failed.message === '隔离未完成，请检查隔离区和源文件', '异常时应提示检查状态而不是报成功')
+  require(text(setup, 'm-1') === beforeScan && text(setup, 'e-done') === beforeExam,
+    '隔离异常不得修改扫描或体检结果')
+}
+
 async function checkUninstallFromExam(): Promise<void> {
   let setup = main()
   let result = await setup.disposition.uninstall('e-done', 'com.a')
@@ -499,6 +518,7 @@ async function checkRingRecalc(): Promise<void> {
 }
 
 export async function runDispositionChecks(): Promise<void> {
+  await checkQuarantineUncommitted()
   await checkRefusals()
   await checkQuarantineFromScan()
   await checkUninstallFromExam()

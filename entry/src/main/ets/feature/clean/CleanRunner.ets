@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit'
 import { CenterError } from '../../center/CenterError'
 import { heavyBudgetMs, heavyMaxBytes, heavyMaxFiles, listMax } from '../../center/CenterLimits'
 import type {
-  BundleRow, CacheRow, CleanReport, DuplicateGroup, FileGrant, FileHit
+  BundleRow, CacheRow, CleanClass, CleanReport, DuplicateGroup, FileGrant, FileHit
 } from '../../center/CenterTypes'
 import type { CleanContext } from '../../task/Contexts'
 import { RunEnd } from '../../task/RunnerRegistry'
@@ -221,7 +221,7 @@ class Hit implements FileHit {
   name: string = ''
   size: number = 0
   sha256: string = ''
-  clazz: FileHit['clazz'] = 'residue'
+  clazz: CleanClass = 'residue'
   reason: string = ''
   selected: boolean = false
   groupId: string = ''

@@ -2,7 +2,7 @@ import { hilog } from '@kit.PerformanceAnalysisKit'
 import { CenterError } from '../../center/CenterError'
 import { heavyBudgetMs, heavyMaxBytes, heavyMaxFiles, listMax } from '../../center/CenterLimits'
 import type {
-  DuplicateGroup, FileGrant, FileHit, FileToolReport
+  CleanClass, DuplicateGroup, FileGrant, FileHit, FileToolReport
 } from '../../center/CenterTypes'
 import { HashWorker, isWorkerDown } from '../../engine/HashWorker'
 import type { InstallerIo } from '../../engine/InstallerScan'
@@ -54,7 +54,7 @@ class Hit implements FileHit {
   name: string = ''
   size: number = 0
   sha256: string = ''
-  clazz: FileHit['clazz'] = 'duplicate'
+  clazz: CleanClass = 'duplicate'
   reason: string = ''
   selected: boolean = false
   groupId: string = ''

@@ -23,8 +23,8 @@ export const QUARANTINE_KEY: string = 'center.quarantine';
 
 export interface QuarantineDesk {
   list(): QuarantineEntry[] | null;
-  restore(id: string, root: string, choose: string): CenterError | null;
-  discard(id: string): CenterError | null;
+  restore(id: string, root: string, choose: string): Promise<CenterError | null>;
+  discard(id: string): Promise<CenterError | null>;
 }
 
 export class QuarantineRow {
@@ -154,7 +154,7 @@ export struct QuarantineView {
     this.rows = quarantineRows(listed);
   }
 
-  private restore(row: QuarantineRow, choose: string): void {
+  private async restore(row: QuarantineRow, choose: string): Promise<void> {
     if (row.entry === null || this.working) {
       return;
     }
@@ -163,7 +163,11 @@ export struct QuarantineView {
       this.notice = UNSUPPORTED;
       return;
     }
-    let error = restoreCall(desk, row.entry, this.grants, choose);
+    this.working = true;
+    let error: CenterError | null;
+    try { error = await restoreCall(desk, row.entry, this.grants, choose); }
+    catch (err) { this.notice = UNREADABLE; return; }
+    finally { this.working = false; }
     if (error === null) {
       this.notice = '';
       this.reload();
@@ -209,13 +213,18 @@ export struct QuarantineView {
     });
   }
 
-  private removeRow(id: string): void {
+  private async removeRow(id: string): Promise<void> {
+    if (this.working) return;
     let desk = AppStorage.get<QuarantineDesk>(QUARANTINE_KEY);
     if (desk === undefined) {
       this.notice = UNSUPPORTED;
       return;
     }
-    let error = discardCall(desk, id);
+    this.working = true;
+    let error: CenterError | null;
+    try { error = await discardCall(desk, id); }
+    catch (err) { this.notice = UNREADABLE; return; }
+    finally { this.working = false; }
     if (error !== null) {
       this.notice = error.message;
       return;
@@ -290,12 +299,12 @@ export function restoreChoose(directory: string, name: string): string {
 }
 
 export function restoreCall(desk: QuarantineDesk, entry: QuarantineEntry, grants: FileGrant[],
-  choose: string): CenterError | null {
+  choose: string): Promise<CenterError | null> {
   let root = choose.length > 0 ? directoryOf(choose) : restoreRoot(entry.from, grants);
   return desk.restore(entry.id, root, choose);
 }
 
-export function discardCall(desk: QuarantineDesk, id: string): CenterError | null {
+export function discardCall(desk: QuarantineDesk, id: string): Promise<CenterError | null> {
   return desk.discard(id);
 }
 

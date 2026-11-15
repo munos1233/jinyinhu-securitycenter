@@ -92,7 +92,7 @@ if (!/status = OPEN/.test(quarantineCode) || !/const OPEN: string = '未完成'/
   !/const KEPT: string = '副本已保存，原文件仍在'/.test(quarantine)) {
   problems.push('committed=false 的状态是未完成，说明副本已保存、原文件仍在')
 }
-const discard = code(box).match(/discard\(id: string\): CenterError \| null \{([\s\S]*?)\n  \}/)
+const discard = code(box).match(/discardOnce\(id: string\): CenterError \| null \{([\s\S]*?)\n  \}/)
 if (discard === null || /found\.from/.test(discard[1]) || !/BLOB_DIR \+ found\.stored/.test(discard[1])) {
   problems.push('删除隔离项只去掉清单和密文，不删除原文件')
 }
@@ -194,7 +194,7 @@ try {
     writeFileSync(join(dir, to), prep(read(from)))
   }
   writeFileSync(join(dir, 'main.ts'),
-    "import { runCleanPagesChecks } from './CleanPages.test.ts';\nrunCleanPagesChecks();\nprocess.stdout.write('CleanView and QuarantineView checks passed\\n');\n")
+    "import { runCleanPagesChecks } from './CleanPages.test.ts';\nawait runCleanPagesChecks();\nprocess.stdout.write('CleanView and QuarantineView checks passed\\n');\n")
   const result = spawnSync(process.execPath, ['--experimental-strip-types', join(dir, 'main.ts')], {
     encoding: 'utf8'
   })

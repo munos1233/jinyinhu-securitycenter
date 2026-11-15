@@ -4,7 +4,8 @@ import { nowIso } from '../center/Clock';
 import { CenterError } from '../center/CenterError';
 import { quarantineQuota } from '../center/CenterLimits';
 import type { FileGrant, QuarantineEntry } from '../center/CenterTypes';
-import { FileOpen, OpenedFile } from '../system/FileOpen';
+import { FileOpen } from '../system/FileOpen';
+import { HashWorker } from '../engine/HashWorker';
 import type { CenterFiles } from './Writer';
 import { Writer } from './Writer';
 
@@ -14,7 +15,6 @@ const KEY_ALIAS: string = 'jinyinhu.center.quarantine'
 const KEY_BITS: number = 256
 const MANIFEST: string = 'center/quarantine/manifest.json'
 const BLOB_DIR: string = 'center/quarantine/blobs/'
-const TEMP_DIR: string = 'center/quarantine/tmp/'
 
 export interface CipherText {
   iv: string
@@ -23,15 +23,34 @@ export interface CipherText {
 }
 
 export interface QuarantineCipher {
-  encrypt(alias: string, bits: number, plain: Uint8Array): CipherText | null
-  decrypt(alias: string, bits: number, bytes: Uint8Array, iv: string, tag: string): Uint8Array | null
+  encrypt(alias: string, bits: number, plain: Uint8Array): Promise<CipherText | null>
+  decrypt(alias: string, bits: number, bytes: Uint8Array, iv: string, tag: string): Promise<Uint8Array | null>
+  encryptStream(alias: string, bits: number, length: number, source: ChunkSource,
+    sink: ChunkSink): Promise<StreamSeal | null>
+  decryptStream(alias: string, bits: number, length: number, source: ChunkSource,
+    sink: ChunkSink, iv: string, tag: string): Promise<string | null>
 }
+
+export interface ChunkSource { read(offset: number, length: number): Uint8Array | null }
+export interface ChunkSink { write(bytes: Uint8Array): boolean }
+export interface StreamSeal { iv: string; tag: string; sha256: string }
 
 export interface ByteStore {
   read(path: string): Uint8Array | null
   readFd(fd: number): Uint8Array | null
   write(path: string, data: Uint8Array): boolean
+  writeNew(path: string, data: Uint8Array): boolean
   remove(path: string): boolean
+  removeOriginal(fd: number, path: string, digest: string): Promise<boolean>
+  sizeFd(fd: number): number
+  readChunkFd(fd: number, offset: number, length: number): Uint8Array | null
+  openBlob(path: string): number
+  writeBlob(fd: number, data: Uint8Array): boolean
+  syncBlob(fd: number): void
+  closeBlob(fd: number): void
+  openReadBlob(path: string): number
+  openAnonymous(id: string): number
+  writeNewFromFd(path: string, sourceFd: number, length: number): boolean
 }
 
 export function bytePath(root: string, path: string): string {
@@ -62,6 +81,7 @@ class Row implements QuarantineEntry {
 
 export class FsByteStore implements ByteStore {
   root: string
+  private blobs: Map<number, fs.File> = new Map<number, fs.File>()
 
   constructor(root: string) {
     this.root = root
@@ -70,9 +90,11 @@ export class FsByteStore implements ByteStore {
   read(path: string): Uint8Array | null {
     try {
       let file = fs.openSync(bytePath(this.root, path), fs.OpenMode.READ_ONLY)
-      let bytes = readWhole(file.fd)
-      fs.closeSync(file)
-      return bytes
+      try {
+        return readWhole(file.fd)
+      } finally {
+        fs.closeSync(file)
+      }
     } catch (err) {
       return null
     }
@@ -86,6 +108,103 @@ export class FsByteStore implements ByteStore {
     }
   }
 
+  sizeFd(fd: number): number {
+    try { return fs.statSync(fd).size } catch (err) { return -1 }
+  }
+
+  readChunkFd(fd: number, offset: number, length: number): Uint8Array | null {
+    try {
+      let buffer = new ArrayBuffer(length)
+      let count = fs.readSync(fd, buffer, { offset: offset, length: length })
+      if (count <= 0 || count > length) return null
+      return new Uint8Array(buffer, 0, count)
+    } catch (err) { return null }
+  }
+
+  openBlob(path: string): number {
+    let full = bytePath(this.root, path)
+    try {
+      let slash = full.lastIndexOf('/')
+      if (slash > 0) { try { fs.mkdirSync(full.substring(0, slash), true) } catch (ignored) { } }
+      let file = fs.openSync(full, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.NOFOLLOW | 0o200)
+      this.blobs.set(file.fd, file)
+      return file.fd
+    } catch (err) { return -1 }
+  }
+
+  writeBlob(fd: number, data: Uint8Array): boolean {
+    try { return writeAll(fd, data) } catch (err) { return false }
+  }
+
+  syncBlob(fd: number): void { fs.fsyncSync(fd) }
+
+  closeBlob(fd: number): void {
+    let file = this.blobs.get(fd)
+    if (file === undefined) throw new Error('unknown blob')
+    try { fs.closeSync(file) } finally { this.blobs.delete(fd) }
+  }
+
+  openReadBlob(path: string): number {
+    try {
+      let file = fs.openSync(bytePath(this.root, path), fs.OpenMode.READ_ONLY | fs.OpenMode.NOFOLLOW)
+      this.blobs.set(file.fd, file)
+      return file.fd
+    } catch (err) { return -1 }
+  }
+
+  /** The directory entry is removed before any plaintext is written. */
+  openAnonymous(id: string): number {
+    let full = bytePath(this.root, 'center/quarantine/tmp/' + id)
+    let file: fs.File | null = null
+    try {
+      let slash = full.lastIndexOf('/')
+      if (slash > 0) { try { fs.mkdirSync(full.substring(0, slash), true) } catch (ignored) { } }
+      file = fs.openSync(full, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.NOFOLLOW | 0o200)
+      fs.unlinkSync(full)
+      this.blobs.set(file.fd, file)
+      return file.fd
+    } catch (err) {
+      if (file !== null) { try { fs.closeSync(file) } catch (ignored) { } }
+      return -1
+    }
+  }
+
+  writeNewFromFd(path: string, sourceFd: number, length: number): boolean {
+    let full = bytePath(this.root, path)
+    let file: fs.File | null = null
+    let ok = false
+    let inode: bigint | null = null
+    try {
+      file = fs.openSync(full, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.NOFOLLOW | 0o200)
+      inode = fs.statSync(file.fd).ino
+      let offset = 0
+      while (offset < length) {
+        let data = this.readChunkFd(sourceFd, offset, Math.min(64 * 1024, length - offset))
+        if (data === null || !writeAll(file.fd, data)) throw new Error('copy failed')
+        offset += data.length
+      }
+      fs.fsyncSync(file.fd)
+      ok = true
+    } catch (err) {
+      if (file !== null) {
+        try {
+          let opened = fs.statSync(file.fd)
+          let current = fs.lstatSync(full)
+          if (opened.ino === current.ino && current.isFile() && !current.isSymbolicLink()) fs.unlinkSync(full)
+        } catch (ignored) { }
+      }
+    } finally {
+      if (file !== null) { try { fs.closeSync(file) } catch (err) { ok = false } }
+    }
+    if (!ok && inode !== null) {
+      try {
+        let current = fs.lstatSync(full)
+        if (current.ino === inode && current.isFile() && !current.isSymbolicLink()) fs.unlinkSync(full)
+      } catch (ignored) { }
+    }
+    return ok
+  }
+
   write(path: string, data: Uint8Array): boolean {
     try {
       let full = bytePath(this.root, path)
@@ -97,10 +216,41 @@ export class FsByteStore implements ByteStore {
         }
       }
       let file = fs.openSync(full, fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
-      fs.writeSync(file.fd, data.buffer)
-      fs.closeSync(file)
+      try {
+        if (!writeAll(file.fd, data)) return false
+      } finally {
+        fs.closeSync(file)
+      }
       return true
     } catch (err) {
+      return false
+    }
+  }
+
+  /** O_EXCL prevents replacing an existing destination, including one created concurrently. */
+  writeNew(path: string, data: Uint8Array): boolean {
+    let full = bytePath(this.root, path)
+    let created = false
+    try {
+      if (path.startsWith(BLOB_DIR)) {
+        let slash = full.lastIndexOf('/')
+        if (slash > 0) {
+          try { fs.mkdirSync(full.substring(0, slash), true) } catch (ignored) { }
+        }
+      }
+      // POSIX O_EXCL is 0o200. If the SDK rejects this flag, fail closed.
+      let file = fs.openSync(full, fs.OpenMode.CREATE | fs.OpenMode.WRITE_ONLY | fs.OpenMode.NOFOLLOW | 0o200)
+      created = true
+      try {
+        if (!writeAll(file.fd, data)) throw new Error('short write')
+      } finally {
+        fs.closeSync(file)
+      }
+      return true
+    } catch (err) {
+      if (created) {
+        try { fs.unlinkSync(full) } catch (ignored) { }
+      }
       return false
     }
   }
@@ -113,16 +263,54 @@ export class FsByteStore implements ByteStore {
       return false
     }
   }
+
+  async removeOriginal(fd: number, path: string, digest: string): Promise<boolean> {
+    try {
+      let opened = fs.statSync(fd)
+      let current = fs.lstatSync(path)
+      if (!opened.isFile() || !current.isFile() || current.isSymbolicLink() ||
+        opened.ino !== current.ino || opened.size !== current.size) return false
+      let result = await new HashWorker().hash(fd, new SharedArrayBuffer(4))
+      if (result.sha256 !== digest || result.bytes !== opened.size) return false
+      let last = fs.lstatSync(path)
+      if (!last.isFile() || last.isSymbolicLink() || last.ino !== opened.ino || last.size !== opened.size) return false
+      fs.unlinkSync(path)
+      return true
+    } catch (err) {
+      return false
+    }
+  }
+}
+
+function writeAll(fd: number, data: Uint8Array): boolean {
+  let offset = 0
+  while (offset < data.length) {
+    let end = Math.min(offset + 1024 * 1024, data.length)
+    let buffer = data.buffer.slice(data.byteOffset + offset, data.byteOffset + end)
+    if (fs.writeSync(fd, buffer) !== end - offset) return false
+    offset = end
+  }
+  return true
 }
 
 function readWhole(fd: number): Uint8Array {
   let stat = fs.statSync(fd)
-  if (stat.size <= 0) {
+  if (stat.size < 0 || stat.size > quarantineQuota) throw new Error('file exceeds quarantine limit')
+  if (stat.size === 0) {
     return new Uint8Array(0)
   }
-  let buffer = new ArrayBuffer(stat.size)
-  fs.readSync(fd, buffer)
-  return new Uint8Array(buffer)
+  let bytes = new Uint8Array(stat.size)
+  let offset = 0
+  while (offset < bytes.length) {
+    let length = Math.min(1024 * 1024, bytes.length - offset)
+    let chunk = new ArrayBuffer(length)
+    let count = fs.readSync(fd, chunk, { offset: offset, length: length })
+    if (count <= 0 || count > length) throw new Error('short read')
+    bytes.set(new Uint8Array(chunk, 0, count), offset)
+    offset += count
+  }
+  if (fs.statSync(fd).size !== stat.size) throw new Error('file changed during read')
+  return bytes
 }
 
 export class Quarantine {
@@ -131,6 +319,7 @@ export class Quarantine {
   private opener: FileOpen
   private cipher: QuarantineCipher
   private ids: () => string
+  private pending: Promise<void> = Promise.resolve()
 
   constructor(files: CenterFiles, bytes: ByteStore, opener: FileOpen, cipher: QuarantineCipher,
     ids: () => string) {
@@ -141,8 +330,14 @@ export class Quarantine {
     this.ids = ids
   }
 
-  put(from: string, size: number, sha256: string, reason: string, root: string,
-    huksReady: boolean): CenterError | QuarantineEntry {
+  async put(from: string, size: number, sha256: string, reason: string, root: string,
+    huksReady: boolean): Promise<CenterError | QuarantineEntry> {
+    return await this.serialize(async (): Promise<CenterError | QuarantineEntry> =>
+      await this.putOnce(from, size, sha256, reason, root, huksReady))
+  }
+
+  private async putOnce(from: string, size: number, sha256: string, reason: string, root: string,
+    huksReady: boolean): Promise<CenterError | QuarantineEntry> {
     if (!huksReady) {
       return this.error('unsupported', 'huks')
     }
@@ -161,46 +356,40 @@ export class Quarantine {
       return opened
     }
     let held = opened
-    let id = this.ids()
-    let temp = TEMP_DIR + id
+    let id: string
+    try { id = this.ids() } catch (err) { this.opener.release(held); return this.error('io', 'id') }
+    if (!/^[0-9a-f]{32}$/.test(id)) {
+      this.opener.release(held)
+      return this.error('io', 'id')
+    }
     let blob = BLOB_DIR + id
     try {
-      let plain = this.readOpened(held, from)
-      if (plain === null) {
-        return this.error('io', from)
+      let actualSize = this.bytes.sizeFd(held.fd)
+      if (actualSize < 0 || actualSize > quarantineQuota) return this.error('quota', '')
+      let counted = actualSize > size ? actualSize : size
+      let again = Writer.exclusive(() => this.quotaState(counted))
+      if (again !== 0) return again === 1 ? this.error('quota', '') : this.error('io', MANIFEST)
+      let blobFd = this.bytes.openBlob(blob)
+      if (blobFd < 0) return this.error('io', blob)
+      let seal: StreamSeal | null = null
+      let closed = false
+      try {
+        seal = await this.cipher.encryptStream(KEY_ALIAS, KEY_BITS, actualSize,
+          new DescriptorSource(this.bytes, held.fd), new DescriptorSink(this.bytes, blobFd))
+        if (seal !== null) this.bytes.syncBlob(blobFd)
+        this.bytes.closeBlob(blobFd)
+        closed = true
+      } catch (err) {
+        seal = null
+      } finally {
+        if (!closed) { try { this.bytes.closeBlob(blobFd) } catch (ignored) { } }
       }
-      if (!this.bytes.write(temp, plain)) {
-        this.bytes.remove(temp)
-        return this.error('io', from)
-      }
-      let copied = this.bytes.read(temp)
-      if (copied === null) {
-        this.bytes.remove(temp)
-        return this.error('io', from)
-      }
-      let digest = sha256Hex(copied)
-      if (sha256.length > 0 && sha256 !== digest) {
-        this.bytes.remove(temp)
-        return this.error('io', from)
-      }
-      let seal = this.cipher.encrypt(KEY_ALIAS, KEY_BITS, copied)
-      if (seal === null || !this.bytes.write(blob, seal.bytes)) {
+      if (seal === null || (sha256.length > 0 && sha256 !== seal.sha256) ||
+        this.bytes.sizeFd(held.fd) !== actualSize) {
         this.bytes.remove(blob)
-        this.bytes.remove(temp)
         return this.error('io', blob)
       }
-      let counted = copied.length > size ? copied.length : size
-      if (counted > size) {
-        let again = Writer.exclusive(() => {
-          return this.quotaState(counted)
-        })
-        if (again !== 0) {
-          this.bytes.remove(blob)
-          this.bytes.remove(temp)
-          return again === 1 ? this.error('quota', '') : this.error('io', MANIFEST)
-        }
-      }
-      this.bytes.remove(temp)
+      let digest = seal.sha256
       let iv = seal.iv
       let tag = seal.tag
       let saved = Writer.exclusive(() => {
@@ -211,7 +400,7 @@ export class Quarantine {
         return this.error('io', MANIFEST)
       }
       let source = held.path.length > 0 ? held.path : from
-      if (!this.bytes.remove(source)) {
+      if (!(await this.bytes.removeOriginal(held.fd, source, digest))) {
         return saved
       }
       let committed = Writer.exclusive(() => {
@@ -223,56 +412,54 @@ export class Quarantine {
       return committed
     } finally {
       this.opener.release(held)
-      this.bytes.remove(temp)
     }
   }
 
-  restore(id: string, root: string, choose: string): CenterError | null {
+  async restore(id: string, root: string, choose: string): Promise<CenterError | null> {
+    return await this.serialize(async (): Promise<CenterError | null> => await this.restoreOnce(id, root, choose))
+  }
+
+  private async restoreOnce(id: string, root: string, choose: string): Promise<CenterError | null> {
     let found = Writer.exclusive(() => {
       return this.find(id)
     })
     if (found === null) {
       return this.error('io', id)
     }
-    let temp = TEMP_DIR + 'restore-' + id
+    if (!/^[0-9a-f]{32}$/.test(id) || found.stored !== id) return this.error('io', id)
+    let encryptedFd = this.bytes.openReadBlob(BLOB_DIR + id)
+    if (encryptedFd < 0) return this.error('io', found.stored)
+    let temporaryFd = -1
     try {
-      let cipherBytes = this.bytes.read(BLOB_DIR + found.stored)
-      if (cipherBytes === null) {
-        return this.error('io', found.stored)
-      }
-      let plain = this.cipher.decrypt(KEY_ALIAS, KEY_BITS, cipherBytes, found.iv, found.tag)
-      if (plain === null) {
-        return this.error('io', found.stored)
-      }
-      if (!this.bytes.write(temp, plain)) {
-        return this.error('io', temp)
-      }
-      let copied = this.bytes.read(temp)
-      if (copied === null) {
-        return this.error('io', temp)
-      }
-      if (sha256Hex(copied) !== found.sha256) {
+      let length = this.bytes.sizeFd(encryptedFd)
+      if (length < 0 || length > quarantineQuota) return this.error('io', found.stored)
+      temporaryFd = this.bytes.openAnonymous(id)
+      if (temporaryFd < 0) return this.error('io', id)
+      let digest = await this.cipher.decryptStream(KEY_ALIAS, KEY_BITS, length,
+        new DescriptorSource(this.bytes, encryptedFd), new DescriptorSink(this.bytes, temporaryFd), found.iv, found.tag)
+      if (digest === null || digest !== found.sha256 || this.bytes.sizeFd(temporaryFd) !== length) {
         return this.error('io', found.sha256)
       }
       let dest = this.destination(found.from, root, choose)
       if (dest instanceof CenterError) {
         return dest
       }
-      if (!this.bytes.write(dest, copied)) {
-        this.bytes.remove(dest)
+      if (!this.bytes.writeNewFromFd(dest, temporaryFd, length)) {
         return this.error('io', dest)
       }
       let removed = Writer.exclusive(() => {
         return this.removeEntry(id)
       })
       if (!removed) {
-        this.bytes.remove(dest)
         return this.error('io', MANIFEST)
       }
       this.bytes.remove(BLOB_DIR + found.stored)
       return null
+    } catch (err) {
+      return this.error('io', id)
     } finally {
-      this.bytes.remove(temp)
+      if (temporaryFd >= 0) { try { this.bytes.closeBlob(temporaryFd) } catch (ignored) { } }
+      try { this.bytes.closeBlob(encryptedFd) } catch (ignored) { }
     }
   }
 
@@ -283,13 +470,18 @@ export class Quarantine {
   }
 
   /** 去掉清单和密文。不删除 from 指向的原文件。 */
-  discard(id: string): CenterError | null {
+  async discard(id: string): Promise<CenterError | null> {
+    return await this.serialize(async (): Promise<CenterError | null> => this.discardOnce(id))
+  }
+
+  private discardOnce(id: string): CenterError | null {
     let found = Writer.exclusive(() => {
       return this.find(id)
     })
     if (found === null) {
       return this.error('io', id)
     }
+    if (!/^[0-9a-f]{32}$/.test(id) || found.stored !== id) return this.error('io', id)
     let removed = Writer.exclusive(() => {
       return this.removeEntry(id)
     })
@@ -298,6 +490,18 @@ export class Quarantine {
     }
     this.bytes.remove(BLOB_DIR + found.stored)
     return null
+  }
+
+  private async serialize<T>(work: () => Promise<T>): Promise<T> {
+    let prior = this.pending
+    let release: () => void = (): void => {}
+    this.pending = new Promise<void>((resolve: () => void): void => { release = resolve })
+    await prior
+    try {
+      return await work()
+    } finally {
+      release()
+    }
   }
 
   private quotaState(size: number): number {
@@ -384,17 +588,6 @@ export class Quarantine {
     return this.replaceManifest(kept)
   }
 
-  private readOpened(opened: OpenedFile, from: string): Uint8Array | null {
-    let viaFd = this.bytes.readFd(opened.fd)
-    if (viaFd !== null) {
-      return viaFd
-    }
-    if (opened.path.length > 0) {
-      return this.bytes.read(opened.path)
-    }
-    return this.bytes.read(from)
-  }
-
   private destination(from: string, root: string, choose: string): CenterError | string {
     let allowed = this.opener.accept(from, root)
     if (!(allowed instanceof CenterError)) {
@@ -437,6 +630,20 @@ export class Quarantine {
   }
 }
 
+class DescriptorSource implements ChunkSource {
+  private store: ByteStore
+  private fd: number
+  constructor(store: ByteStore, fd: number) { this.store = store; this.fd = fd }
+  read(offset: number, length: number): Uint8Array | null { return this.store.readChunkFd(this.fd, offset, length) }
+}
+
+class DescriptorSink implements ChunkSink {
+  private store: ByteStore
+  private fd: number
+  constructor(store: ByteStore, fd: number) { this.store = store; this.fd = fd }
+  write(bytes: Uint8Array): boolean { return this.store.writeBlob(this.fd, bytes) }
+}
+
 function rowFrom(raw: Object): Row {
   let peek = raw as Row
   let row = new Row()
@@ -451,106 +658,4 @@ function rowFrom(raw: Object): Row {
   row.at = typeof peek.at === 'string' ? peek.at : ''
   row.committed = peek.committed === true
   return row
-}
-
-const K: number[] = [
-  0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-  0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-  0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-  0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-  0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-  0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-  0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-  0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
-]
-
-function sha256Hex(data: Uint8Array): string {
-  let h0 = 0x6a09e667
-  let h1 = 0xbb67ae85
-  let h2 = 0x3c6ef372
-  let h3 = 0xa54ff53a
-  let h4 = 0x510e527f
-  let h5 = 0x9b05688c
-  let h6 = 0x1f83d9ab
-  let h7 = 0x5be0cd19
-  let bitHi = Math.floor(data.length / 0x20000000)
-  let bitLo = (data.length << 3) >>> 0
-  let padded = data.length + 1
-  while (padded % 64 !== 56) {
-    padded++
-  }
-  let buf = new Uint8Array(padded + 8)
-  for (let i = 0; i < data.length; i++) {
-    buf[i] = data[i]
-  }
-  buf[data.length] = 0x80
-  buf[buf.length - 8] = (bitHi >>> 24) & 0xff
-  buf[buf.length - 7] = (bitHi >>> 16) & 0xff
-  buf[buf.length - 6] = (bitHi >>> 8) & 0xff
-  buf[buf.length - 5] = bitHi & 0xff
-  buf[buf.length - 4] = (bitLo >>> 24) & 0xff
-  buf[buf.length - 3] = (bitLo >>> 16) & 0xff
-  buf[buf.length - 2] = (bitLo >>> 8) & 0xff
-  buf[buf.length - 1] = bitLo & 0xff
-  let w: number[] = []
-  for (let i = 0; i < 64; i++) {
-    w.push(0)
-  }
-  for (let block = 0; block < buf.length; block += 64) {
-    for (let i = 0; i < 16; i++) {
-      let at = block + i * 4
-      w[i] = ((buf[at] << 24) | (buf[at + 1] << 16) | (buf[at + 2] << 8) | buf[at + 3]) >>> 0
-    }
-    for (let i = 16; i < 64; i++) {
-      let s0 = (rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >>> 3)) >>> 0
-      let s1 = (rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >>> 10)) >>> 0
-      w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0
-    }
-    let a = h0
-    let b = h1
-    let c = h2
-    let d = h3
-    let e = h4
-    let f = h5
-    let g = h6
-    let h = h7
-    for (let i = 0; i < 64; i++) {
-      let s1 = (rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25)) >>> 0
-      let ch = ((e & f) ^ ((~e) & g)) >>> 0
-      let temp1 = (h + s1 + ch + K[i] + w[i]) >>> 0
-      let s0 = (rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22)) >>> 0
-      let maj = ((a & b) ^ (a & c) ^ (b & c)) >>> 0
-      let temp2 = (s0 + maj) >>> 0
-      h = g
-      g = f
-      f = e
-      e = (d + temp1) >>> 0
-      d = c
-      c = b
-      b = a
-      a = (temp1 + temp2) >>> 0
-    }
-    h0 = (h0 + a) >>> 0
-    h1 = (h1 + b) >>> 0
-    h2 = (h2 + c) >>> 0
-    h3 = (h3 + d) >>> 0
-    h4 = (h4 + e) >>> 0
-    h5 = (h5 + f) >>> 0
-    h6 = (h6 + g) >>> 0
-    h7 = (h7 + h) >>> 0
-  }
-  return hex32(h0) + hex32(h1) + hex32(h2) + hex32(h3) + hex32(h4) + hex32(h5) + hex32(h6) + hex32(h7)
-}
-
-function rotr(value: number, bits: number): number {
-  return (value >>> bits) | (value << (32 - bits))
-}
-
-function hex32(value: number): string {
-  let digits = '0123456789abcdef'
-  let out = ''
-  for (let shift = 28; shift >= 0; shift -= 4) {
-    out += digits.charAt((value >>> shift) & 0xf)
-  }
-  return out
 }

@@ -35,7 +35,7 @@ const NO_TRUST: string[] = ['impersonation', 'cert-uncompared', 'bundle-cert-mis
 
 /** 隔离入口。授权根和 HUKS 状态由组合根绑定，这里只给出源 uri。 */
 export interface QuarantineDoor {
-  put(from: string, size: number, sha256: string, reason: string): CenterError | QuarantineEntry
+  put(from: string, size: number, sha256: string, reason: string, jobId: string): Promise<CenterError | QuarantineEntry>
 }
 
 /** 只删除本应用 cacheDir 里的文件，返回实际删掉的字节。 */
@@ -187,10 +187,22 @@ export class Disposition {
     } else {
       return refuse(NOT_SETTLED)
     }
-    let put = this.ports.quarantine.put(uri, size, sha256, reason)
+    let put: CenterError | QuarantineEntry
+    try {
+      put = await this.ports.quarantine.put(uri, size, sha256, reason, jobId)
+    } catch (err) {
+      let result = refuse('隔离未完成，请检查隔离区和源文件')
+      audit(located.record, '隔离', uri, result.message, false)
+      return result
+    }
     if (put instanceof CenterError) {
       audit(located.record, '隔离', uri, put.message, false)
       return refuse(put.message)
+    }
+    if (!put.committed) {
+      let message = '副本已保存，原文件仍在'
+      audit(located.record, '隔离', uri, message, false)
+      return refuse(message)
     }
     let touch = new ExamTouch()
     touch.hitAction = 'quarantine'

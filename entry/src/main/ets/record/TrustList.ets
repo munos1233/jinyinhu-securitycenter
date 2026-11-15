@@ -18,6 +18,11 @@ class TrustRow implements TrustEntry {
 }
 
 export class TrustList {
+  /** Snapshot for a scan; malformed storage must not produce trusted entries. */
+  static snapshot(): TrustEntry[] {
+    return TrustList.readRows() ?? []
+  }
+
   static trustBundle(certSha256: string, certAlgo: CertAlgo, bundleName: string, versionCode: number): boolean {
     if (certAlgo === 'none') {
       return false

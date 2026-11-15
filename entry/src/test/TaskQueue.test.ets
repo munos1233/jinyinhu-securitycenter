@@ -354,6 +354,13 @@ async function sameRequestRules(): Promise<void> {
   h.table.permission = async (ctx, hand) => end(0, '')
   let first = h.queue.enqueue(request('malware', 'custom', ['file:///b', 'file:///a', ''], ''))
   require(first.length > 0, '成功入队的 jobId 非空')
+  let selected = h.queue.requestOf(first)
+  require(selected !== null && selected.scope === 'custom' && selected.uris.length === 2,
+    '用户当次选择的路径可供同一次作业的后续处置使用')
+  if (selected !== null) selected.uris.length = 0
+  let saved = h.queue.requestOf(first)
+  require(saved !== null && saved.uris.length === 2 && h.queue.requestOf('missing') === null,
+    '查询请求必须返回独立快照，并拒绝未知作业')
   let again = h.queue.enqueue(request('malware', 'custom', ['file:///a', 'file:///b', 'file:///a'], ''))
   require(again === first, '相同请求返回已有 jobId')
   require(h.queue.enqueue(request('malware', 'full', [], '')) === '', '同 kind 不同 scope 返回空串')

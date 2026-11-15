@@ -128,12 +128,12 @@ class Desk implements QuarantineDesk {
     return []
   }
 
-  restore(id: string, root: string, choose: string): CenterError | null {
+  async restore(id: string, root: string, choose: string): Promise<CenterError | null> {
     this.restored.push(id + '|' + root + '|' + choose)
     return null
   }
 
-  discard(id: string): CenterError | null {
+  async discard(id: string): Promise<CenterError | null> {
     this.discarded.push(id)
     return null
   }
@@ -213,7 +213,7 @@ function hasSection(params: string, report: CleanReport, id: string): boolean {
   return false
 }
 
-export function runCleanPagesChecks(): void {
+export async function runCleanPagesChecks(): Promise<void> {
   if (cleanKind('cache') !== 'clean' || cleanKind('installer') !== 'clean' || cleanKind('residue') !== 'clean' ||
     cleanKind('') !== 'clean') {
     fail('cache、installer、residue 都入队 kind=clean')
@@ -352,11 +352,11 @@ export function runCleanPagesChecks(): void {
     fail('恢复优先写回原授权目录，另选目录时带上文件名')
   }
   let desk = new Desk()
-  if (restoreCall(desk, kept, [grant], '') !== null || desk.restored[0] !== 'q1|/storage/users|' ||
+  if (await restoreCall(desk, kept, [grant], '') !== null || desk.restored[0] !== 'q1|/storage/users|' ||
     desk.discarded.length !== 0) {
     fail('恢复只调用隔离区恢复，不删除')
   }
-  if (discardCall(desk, 'q1') !== null || desk.discarded[0] !== 'q1') {
+  if (await discardCall(desk, 'q1') !== null || desk.discarded[0] !== 'q1') {
     fail('删除要走到隔离区 discard')
   }
   if (quarantineTitle(null) !== '无法读取该结果' || quarantineTitle([]) !== '隔离区没有文件') {

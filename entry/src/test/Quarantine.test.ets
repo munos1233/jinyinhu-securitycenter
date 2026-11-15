@@ -3,8 +3,9 @@ import { quarantineQuota } from '../main/ets/center/CenterLimits'
 import type { FileGrant, QuarantineEntry } from '../main/ets/center/CenterTypes'
 import type { FileView } from '../main/ets/system/FileOpen'
 import { FileOpen } from '../main/ets/system/FileOpen'
-import type { CipherText, QuarantineCipher } from '../main/ets/record/Quarantine'
+import type { ChunkSink, ChunkSource, CipherText, QuarantineCipher, StreamSeal } from '../main/ets/record/Quarantine'
 import { bytePath, Quarantine } from '../main/ets/record/Quarantine'
+import { StreamingSha256 } from '../main/ets/record/StreamingSha256'
 import type { ByteStore } from '../main/ets/record/Quarantine'
 import type { CenterFiles } from '../main/ets/record/Writer'
 import { Writer } from '../main/ets/record/Writer'
@@ -56,14 +57,74 @@ class MemoryBytes implements ByteStore {
   reads: string[] = []
   failRemove: string = ''
   failWrite: string = ''
+  failRead: string = ''
+  failSync: boolean = false
+  fdPath: () => string = (): string => ''
+  lastRead: Uint8Array | null = null
+  blobPath: string = ''
+  readBlobPath: string = ''
+  scratch: Uint8Array = new Uint8Array(0)
   trace: string[] = []
 
   readFd(fd: number): Uint8Array | null {
-    return null
+    let data = this.read(this.fdPath())
+    this.lastRead = data === null ? null : data.slice()
+    return data
+  }
+
+  sizeFd(fd: number): number {
+    if (fd === 10) return this.scratch.length
+    if (fd === 9) return (this.values.get(this.readBlobPath) ?? new Uint8Array(0)).length
+    let data = this.values.get(this.fdPath())
+    return data === undefined ? -1 : data.length
+  }
+
+  readChunkFd(fd: number, offset: number, length: number): Uint8Array | null {
+    if (fd === 10) return this.scratch.slice(offset, offset + length)
+    if (fd === 9) return (this.values.get(this.readBlobPath) ?? new Uint8Array(0)).slice(offset, offset + length)
+    let data = this.read(this.fdPath())
+    return data === null ? null : data.slice(offset, offset + length)
+  }
+
+  openBlob(path: string): number {
+    if (!this.writeNew(path, new Uint8Array(0))) return -1
+    this.blobPath = path
+    return 8
+  }
+
+  writeBlob(fd: number, data: Uint8Array): boolean {
+    if (fd === 10) {
+      let combined = new Uint8Array(this.scratch.length + data.length)
+      combined.set(this.scratch); combined.set(data, this.scratch.length); this.scratch = combined
+      return true
+    }
+    if (this.blobPath === this.failWrite) return false
+    let old = this.values.get(this.blobPath) ?? new Uint8Array(0)
+    let combined = new Uint8Array(old.length + data.length)
+    combined.set(old); combined.set(data, old.length)
+    this.values.set(this.blobPath, combined)
+    return true
+  }
+
+  closeBlob(fd: number): void {}
+  syncBlob(fd: number): void { if (this.failSync) throw new Error('sync failed') }
+
+  openReadBlob(path: string): number {
+    if (!this.values.has(path)) return -1
+    this.readBlobPath = path
+    return 9
+  }
+
+  openAnonymous(id: string): number { this.scratch = new Uint8Array(0); return 10 }
+
+  writeNewFromFd(path: string, sourceFd: number, length: number): boolean {
+    if (this.scratch.length !== length) return false
+    return this.writeNew(path, this.scratch)
   }
 
   read(path: string): Uint8Array | null {
     this.reads.push(path)
+    if (path === this.failRead) return null
     if (!this.values.has(path)) {
       return null
     }
@@ -75,6 +136,7 @@ class MemoryBytes implements ByteStore {
   }
 
   write(path: string, data: Uint8Array): boolean {
+    if (path.indexOf('/tmp/') >= 0) this.trace.push('temp')
     if (path === this.failWrite) {
       let partial = new Uint8Array(3)
       partial[0] = 1
@@ -87,6 +149,15 @@ class MemoryBytes implements ByteStore {
     return true
   }
 
+  writeNew(path: string, data: Uint8Array): boolean {
+    if (this.values.has(path)) return false
+    if (!this.write(path, data)) {
+      this.values.delete(path)
+      return false
+    }
+    return true
+  }
+
   remove(path: string): boolean {
     if (path.indexOf('/tmp/') >= 0) {
       this.trace.push('temp')
@@ -96,6 +167,15 @@ class MemoryBytes implements ByteStore {
     }
     this.values.delete(path)
     return true
+  }
+
+  async removeOriginal(fd: number, path: string, digest: string): Promise<boolean> {
+    let current = this.values.get(path)
+    if (current === undefined) return false
+    let hash = new StreamingSha256()
+    hash.update(current)
+    if (hash.finish() !== digest) return false
+    return this.remove(path)
   }
 }
 
@@ -134,7 +214,29 @@ class FakeCipher implements QuarantineCipher {
   bits: number = 0
   fail: boolean = false
 
-  encrypt(alias: string, bits: number, plain: Uint8Array): CipherText | null {
+  async encryptStream(alias: string, bits: number, length: number, source: ChunkSource,
+    sink: ChunkSink): Promise<StreamSeal | null> {
+    let plain = length === 0 ? new Uint8Array(0) : source.read(0, length)
+    if (plain === null || plain.length !== length) return null
+    let digest = new StreamingSha256()
+    digest.update(plain)
+    let result = await this.encrypt(alias, bits, plain)
+    if (result === null || !sink.write(result.bytes)) return null
+    return { iv: result.iv, tag: result.tag, sha256: digest.finish() }
+  }
+
+  async decryptStream(alias: string, bits: number, length: number, source: ChunkSource,
+    sink: ChunkSink, iv: string, tag: string): Promise<string | null> {
+    let bytes = length === 0 ? new Uint8Array(0) : source.read(0, length)
+    if (bytes === null || bytes.length !== length) return null
+    let plain = await this.decrypt(alias, bits, bytes, iv, tag)
+    if (plain === null || !sink.write(plain)) return null
+    let digest = new StreamingSha256()
+    digest.update(plain)
+    return digest.finish()
+  }
+
+  async encrypt(alias: string, bits: number, plain: Uint8Array): Promise<CipherText | null> {
     this.alias = alias
     this.bits = bits
     if (this.fail) {
@@ -147,7 +249,7 @@ class FakeCipher implements QuarantineCipher {
     return textOf('aXY=', 'dGFn', out)
   }
 
-  decrypt(alias: string, bits: number, bytes: Uint8Array, iv: string, tag: string): Uint8Array | null {
+  async decrypt(alias: string, bits: number, bytes: Uint8Array, iv: string, tag: string): Promise<Uint8Array | null> {
     this.alias = alias
     this.bits = bits
     if (this.fail || iv !== 'aXY=' || tag !== 'dGFn') {
@@ -201,6 +303,7 @@ function same(left: Uint8Array | null, right: Uint8Array): boolean {
 
 function box(files: MemoryFiles, bytes: MemoryBytes, view: MapView, cipher: FakeCipher): Quarantine {
   Writer.bind(files)
+  bytes.fdPath = (): string => view.opened.length === 0 ? '' : view.opened[view.opened.length - 1]
   return new Quarantine(files, bytes, new FileOpen(view), cipher, () => {
     return ID
   })
@@ -214,7 +317,7 @@ function rows(files: MemoryFiles): QuarantineEntry[] {
   return JSON.parse(text) as QuarantineEntry[]
 }
 
-export function runQuarantineChecks(): void {
+export async function runQuarantineChecks(): Promise<void> {
   let rooted = bytePath('/data/storage/el2/base/files', 'center/quarantine/blobs/' + ID)
   if (rooted !== '/data/storage/el2/base/files/center/quarantine/blobs/' + ID ||
     bytePath('/data/storage/el2/base/files', FROM) !== FROM) {
@@ -230,14 +333,14 @@ export function runQuarantineChecks(): void {
   if (Quarantine.prototype['clearAll'] !== undefined) {
     fail('提供了清空全部')
   }
-  let blocked = box1.put(FROM, 1, '', '安装包', ROOT, false)
+  let blocked = await box1.put(FROM, 1, '', '安装包', ROOT, false)
   if (!(blocked instanceof CenterError) || blocked.code !== 'unsupported' ||
     blocked.message !== '当前系统不支持此功能' || files.read(MANIFEST) !== null ||
     bytes.reads.length !== 0 || view.opened.length !== 0) {
     fail('huks 未就绪时仍然写入了隔离区')
   }
 
-  let full = box1.put(FROM, quarantineQuota + 1, '', '安装包', ROOT, true)
+  let full = await box1.put(FROM, quarantineQuota + 1, '', '安装包', ROOT, true)
   if (!(full instanceof CenterError) || full.code !== 'quota' || full.message !== '隔离区已满' ||
     bytes.reads.length !== 0 || view.opened.length !== 0 || files.read(MANIFEST) !== null) {
     fail('配额不足时写了文件')
@@ -245,33 +348,33 @@ export function runQuarantineChecks(): void {
 
   view.opened = []
   bytes.reads = []
-  let denied = box1.put('/system/bin/sh', 3, '', '安装包', ROOT, true)
+  let denied = await box1.put('/system/bin/sh', 3, '', '安装包', ROOT, true)
   if (!(denied instanceof CenterError) || denied.code !== 'rejected-system-path' ||
     view.opened.length !== 0 || bytes.reads.length !== 0 || bytes.values.has('/system/bin/sh')) {
     fail('系统路径被隔离或读取了')
   }
-  let privateDenied = box1.put('/data/app/readme', 3, '', '安装包', '/storage/media', true)
+  let privateDenied = await box1.put('/data/app/readme', 3, '', '安装包', '/storage/media', true)
   if (!(privateDenied instanceof CenterError) || privateDenied.code !== 'rejected-system-path' ||
     bytes.reads.length !== 0) {
     fail('/data/app 没有跟 FileOpen 同一套拒绝')
   }
   view.real.set('/storage/users/link', '/dev/null')
   bytes.values.set('/storage/users/link', plain)
-  let linked = box1.put('/storage/users/link', 3, '', '安装包', ROOT, true)
+  let linked = await box1.put('/storage/users/link', 3, '', '安装包', ROOT, true)
   if (!(linked instanceof CenterError) || linked.code !== 'rejected-system-path' ||
     bytes.values.has('/storage/users/link') !== true) {
     fail('指向系统目录的符号链接被读取了')
   }
 
   bytes.reads = []
-  let mismatch = box1.put(FROM, plain.length, 'aa', '安装包', ROOT, true)
+  let mismatch = await box1.put(FROM, plain.length, 'aa', '安装包', ROOT, true)
   if (!(mismatch instanceof CenterError) || mismatch.code !== 'io' || files.read(MANIFEST) !== null ||
     bytes.values.has(FROM) !== true || bytes.values.has('center/quarantine/tmp/' + ID) === true) {
     fail('哈希不一致时改了源文件或留下了明文')
   }
 
   cipher.fail = true
-  let encryptFail = box1.put(FROM, plain.length, '', '安装包', ROOT, true)
+  let encryptFail = await box1.put(FROM, plain.length, '', '安装包', ROOT, true)
   cipher.fail = false
   if (!(encryptFail instanceof CenterError) || encryptFail.code !== 'io' || files.read(MANIFEST) !== null ||
     bytes.values.has('center/quarantine/blobs/' + ID) === true ||
@@ -280,7 +383,7 @@ export function runQuarantineChecks(): void {
   }
 
   bytes.failRemove = FROM
-  let kept = box1.put(FROM, plain.length, '', '安装包', ROOT, true)
+  let kept = await box1.put(FROM, plain.length, '', '安装包', ROOT, true)
   bytes.failRemove = ''
   if (kept instanceof CenterError || kept.committed || kept.sha256 !== ABC || kept.stored !== ID ||
     kept.id.length !== 32 || kept.id !== ID || kept.stored.indexOf('.') >= 0 || kept.iv !== 'aXY=' ||
@@ -293,50 +396,57 @@ export function runQuarantineChecks(): void {
     bytes.values.has('center/quarantine/tmp/' + ID) === true || same(blob === undefined ? null : blob, plain)) {
     fail('未完成条目删了源，或密文目录里有明文')
   }
+  let existing = bytesOf('existing destination')
+  bytes.values.set(FROM, existing)
+  let refusesOverwrite = await box1.restore(ID, ROOT, '')
+  if (!(refusesOverwrite instanceof CenterError) || !same(bytes.values.get(FROM) ?? null, existing) || rows(files).length !== 1) {
+    fail('恢复不得覆盖已存在的目标，也不得删除隔离清单')
+  }
+  bytes.values.set(FROM, plain)
 
   bytes.values.delete('center/quarantine/blobs/' + ID)
   files.values.delete(MANIFEST)
   bytes.trace = []
   files.trace = bytes.trace
   view.closes = 0
-  let done = box1.put(FROM, plain.length, ABC, '安装包', ROOT, true)
+  let done = await box1.put(FROM, plain.length, ABC, '安装包', ROOT, true)
   if (view.closes !== 1) {
     fail('隔离复制后没有关闭文件')
   }
-  let tempAt = bytes.trace.indexOf('temp')
   let manifestAt = bytes.trace.indexOf('manifest')
-  if (tempAt < 0 || manifestAt < 0 || tempAt > manifestAt) {
-    fail('临时明文留到了写入 committed=false 之后')
+  if (bytes.trace.indexOf('temp') >= 0 || manifestAt < 0) {
+    fail('隔离过程不应写入临时明文，并应写入清单')
   }
   if (done instanceof CenterError || !done.committed || done.sha256 !== ABC || bytes.values.has(FROM) === true) {
     fail('删源成功后没有把清单改成 committed=true')
   }
   bytes.reads = []
-  let overflow = box1.put('/storage/users/b.txt', quarantineQuota, '', '安装包', ROOT, true)
+  let overflow = await box1.put('/storage/users/b.txt', quarantineQuota, '', '安装包', ROOT, true)
   if (!(overflow instanceof CenterError) || overflow.code !== 'quota' ||
     bytes.reads.indexOf('/storage/users/b.txt') >= 0) {
     fail('已有明文后再放入超额文件没有拒绝')
   }
 
   files.values.delete(MANIFEST)
+  bytes.values.delete('center/quarantine/blobs/' + ID)
   bytes.values.set(FROM, plain)
-  let restored = box1.put(FROM, plain.length, '', '安装包', ROOT, true)
+  let restored = await box1.put(FROM, plain.length, '', '安装包', ROOT, true)
   if (restored instanceof CenterError) {
     fail('恢复前的隔离失败')
     return
   }
-  let back = box1.restore(ID, ROOT, '')
+  let back = await box1.restore(ID, ROOT, '')
   if (back !== null || !same(bytes.values.get(FROM) === undefined ? null : bytes.values.get(FROM) as Uint8Array, plain) ||
     rows(files).length !== 0) {
     fail('恢复没有把明文写回原路径或没有从清单去掉')
   }
 
   bytes.values.set(FROM, plain)
-  box1.put(FROM, plain.length, '', '安装包', ROOT, true)
+  await box1.put(FROM, plain.length, '', '安装包', ROOT, true)
   let edited = rows(files)
   edited[0].sha256 = '00'
   files.write(MANIFEST, JSON.stringify(edited))
-  let badHash = box1.restore(ID, ROOT, '')
+  let badHash = await box1.restore(ID, ROOT, '')
   if (!(badHash instanceof CenterError) || badHash.code !== 'io' || rows(files).length !== 1 ||
     bytes.values.has(FROM) === true) {
     fail('明文哈希不符时写回了文件或删了清单')
@@ -346,21 +456,21 @@ export function runQuarantineChecks(): void {
   edited[0].sha256 = ABC
   edited[0].from = '/system/bin/sh'
   files.write(MANIFEST, JSON.stringify(edited))
-  let badTarget = box1.restore(ID, ROOT, '')
+  let badTarget = await box1.restore(ID, ROOT, '')
   if (!(badTarget instanceof CenterError) || badTarget.code !== 'rejected-system-path' ||
     bytes.values.has('/system/bin/sh') === true || rows(files).length !== 1) {
     fail('恢复目标被拒绝时仍然写了文件')
   }
 
   bytes.failWrite = '/storage/other/b.txt'
-  let partial = box1.restore(ID, '/storage/other', '/storage/other/b.txt')
+  let partial = await box1.restore(ID, '/storage/other', '/storage/other/b.txt')
   bytes.failWrite = ''
   if (!(partial instanceof CenterError) || rows(files)[0].from !== '/system/bin/sh' ||
     bytes.values.has('/storage/other/b.txt') === true) {
     fail('另选目录写失败时改了清单或留下了残缺文件')
   }
 
-  let moved = box1.restore(ID, '/storage/other', '/storage/other/b.txt')
+  let moved = await box1.restore(ID, '/storage/other', '/storage/other/b.txt')
   if (moved !== null || rows(files).length !== 0 ||
     !same(bytes.values.get('/storage/other/b.txt') === undefined ? null : bytes.values.get('/storage/other/b.txt') as Uint8Array, plain)) {
     fail('另选目录通过 FileOpen 后没有写回，或写回前就改了清单')
@@ -373,21 +483,21 @@ export function runQuarantineChecks(): void {
   bytes2.values.set(FROM, plain)
   bytes2.values.set('/storage/users/b.txt', plain)
   let box2 = box(files2, bytes2, view2, cipher2)
-  bytes2.failWrite = 'center/quarantine/tmp/' + ID
-  let copyFail = box2.put(FROM, plain.length, '', '安装包', ROOT, true)
-  bytes2.failWrite = ''
+  bytes2.failRead = FROM
+  let copyFail = await box2.put(FROM, plain.length, '', '安装包', ROOT, true)
+  bytes2.failRead = ''
   if (!(copyFail instanceof CenterError) || copyFail.code !== 'io' || files2.read(MANIFEST) !== null ||
     bytes2.values.has('center/quarantine/tmp/' + ID) === true || bytes2.values.has(FROM) !== true) {
     fail('复制失败不是 io，或留下了临时明文和清单')
   }
-  let first = box2.put(FROM, quarantineQuota - 1, '', '安装包', ROOT, true)
+  let first = await box2.put(FROM, quarantineQuota - 1, '', '安装包', ROOT, true)
   if (first instanceof CenterError || first.size !== quarantineQuota - 1) {
     fail('第一份不到配额的明文没有记入累计')
     return
   }
   bytes2.values.set(FROM, plain)
   bytes2.reads = []
-  let second = box2.put('/storage/users/b.txt', 2, '', '安装包', ROOT, true)
+  let second = await box2.put('/storage/users/b.txt', 2, '', '安装包', ROOT, true)
   if (!(second instanceof CenterError) || second.code !== 'quota' || second.message !== '隔离区已满' ||
     bytes2.reads.indexOf('/storage/users/b.txt') >= 0 || rows(files2).length !== 1) {
     fail('两份都不到配额、加在一起超过时没有拒绝')
@@ -399,11 +509,11 @@ export function runQuarantineChecks(): void {
   let cipher3 = new FakeCipher()
   bytes3.values.set(FROM, plain)
   let box3 = box(files3, bytes3, view3, cipher3)
-  let viaUri = box3.put('file://' + FROM, plain.length, '', '安装包', ROOT, true)
+  let viaUri = await box3.put('file://' + FROM, plain.length, '', '安装包', ROOT, true)
   if (viaUri instanceof CenterError || !viaUri.committed || bytes3.values.has(FROM)) {
     fail('file:// 没有按解析出的路径完成隔离')
   }
-  let backUri = box3.restore(ID, ROOT, '')
+  let backUri = await box3.restore(ID, ROOT, '')
   if (backUri !== null || !same(bytes3.values.get(FROM) === undefined ? null : bytes3.values.get(FROM) as Uint8Array, plain) ||
     rows(files3).length !== 0) {
     fail('源文件已经删除后没有写回原路径')
@@ -416,7 +526,7 @@ export function runQuarantineChecks(): void {
   bytes4.values.set(FROM, plain)
   let box4 = box(files4, bytes4, view4, cipher4)
   bytes4.failRemove = FROM
-  let pending = box4.put(FROM, plain.length, '', '安装包', ROOT, true)
+  let pending = await box4.put(FROM, plain.length, '', '安装包', ROOT, true)
   bytes4.failRemove = ''
   if (pending instanceof CenterError || pending.committed) {
     fail('删除测试前没有留下未完成条目')
@@ -426,7 +536,18 @@ export function runQuarantineChecks(): void {
   if (shown === null || shown.length !== 1 || shown[0].committed || shown[0].from !== FROM) {
     fail('隔离区列表没有读出未完成条目')
   }
-  let dropped = box4.discard(pending.id)
+  let tampered = rows(files4)
+  tampered[0].stored = '../../other-file'
+  files4.write(MANIFEST, JSON.stringify(tampered))
+  bytes4.values.set('center/quarantine/blobs/../../other-file', plain)
+  let blockedDelete = await box4.discard(pending.id)
+  if (!(blockedDelete instanceof CenterError) || rows(files4).length !== 1 ||
+    !bytes4.values.has('center/quarantine/blobs/../../other-file')) {
+    fail('损坏清单里的密文路径不得用于删除其他文件')
+  }
+  tampered[0].stored = pending.id
+  files4.write(MANIFEST, JSON.stringify(tampered))
+  let dropped = await box4.discard(pending.id)
   if (dropped !== null || rows(files4).length !== 0 || bytes4.values.has(FROM) !== true ||
     bytes4.values.has('center/quarantine/blobs/' + ID) === true) {
     fail('删除隔离项时删了原文件，或没有去掉清单和密文')
@@ -434,5 +555,85 @@ export function runQuarantineChecks(): void {
   files4.write(MANIFEST, '{')
   if (box4.list() !== null) {
     fail('坏清单被显示成空的隔离区')
+  }
+
+  let files5 = new MemoryFiles()
+  let bytes5 = new MemoryBytes()
+  let view5 = new MapView()
+  let cipher5 = new PausedCipher()
+  bytes5.values.set(FROM, plain)
+  bytes5.values.set('/storage/users/b.txt', plain)
+  let box5 = box(files5, bytes5, view5, cipher5)
+  let firstPending = box5.put(FROM, quarantineQuota - 1, '', '安装包', ROOT, true)
+  await cipher5.started
+  let secondPending = box5.put('/storage/users/b.txt', 2, '', '安装包', ROOT, true)
+  cipher5.resume()
+  let firstConcurrent = await firstPending
+  let secondConcurrent = await secondPending
+  if (firstConcurrent instanceof CenterError || !(secondConcurrent instanceof CenterError) ||
+    secondConcurrent.code !== 'quota' || !bytes5.values.has('/storage/users/b.txt')) {
+    fail('并发隔离必须串行计算配额，超额时保留源文件')
+  }
+
+  let files6 = new MemoryFiles()
+  let bytes6 = new MemoryBytes()
+  let view6 = new MapView()
+  bytes6.values.set(FROM, plain)
+  let changed = bytesOf('xyz')
+  let cipher6 = new ChangingCipher(bytes6, changed)
+  let box6 = box(files6, bytes6, view6, cipher6)
+  let changedResult = await box6.put(FROM, plain.length, '', '安装包', ROOT, true)
+  if (changedResult instanceof CenterError || changedResult.committed ||
+    !same(bytes6.values.get(FROM) ?? null, changed)) {
+    fail('加密期间源文件发生变化时必须保留新文件并标记未完成')
+  }
+
+  let files7 = new MemoryFiles()
+  let bytes7 = new MemoryBytes()
+  let view7 = new MapView()
+  bytes7.values.set(FROM, plain)
+  let previousBlob = bytesOf('existing encrypted data')
+  bytes7.values.set('center/quarantine/blobs/' + ID, previousBlob)
+  let box7 = box(files7, bytes7, view7, new FakeCipher())
+  let collision = await box7.put(FROM, plain.length, '', '安装包', ROOT, true)
+  if (!(collision instanceof CenterError) || !same(bytes7.values.get('center/quarantine/blobs/' + ID) ?? null, previousBlob) ||
+    !bytes7.values.has(FROM) || files7.read(MANIFEST) !== null) {
+    fail('密文文件名碰撞不得覆盖现有密文或删除源文件')
+  }
+
+  let files8 = new MemoryFiles()
+  let bytes8 = new MemoryBytes()
+  bytes8.values.set(FROM, plain)
+  bytes8.failSync = true
+  let box8 = box(files8, bytes8, new MapView(), new FakeCipher())
+  let syncFailure = await box8.put(FROM, plain.length, '', '安装包', ROOT, true)
+  if (!(syncFailure instanceof CenterError) || !bytes8.values.has(FROM) ||
+    bytes8.values.has('center/quarantine/blobs/' + ID) || files8.read(MANIFEST) !== null) {
+    fail('密文持久化失败不得删除源文件或写清单')
+  }
+}
+
+class PausedCipher extends FakeCipher {
+  resume: () => void = (): void => {}
+  startedResolve: () => void = (): void => {}
+  started: Promise<void> = new Promise<void>((resolve: () => void): void => { this.startedResolve = resolve })
+  async encrypt(alias: string, bits: number, plain: Uint8Array): Promise<CipherText | null> {
+    await new Promise<void>((resolve: () => void): void => { this.resume = resolve; this.startedResolve() })
+    return await super.encrypt(alias, bits, plain)
+  }
+}
+
+class ChangingCipher extends FakeCipher {
+  private bytes: MemoryBytes
+  private replacement: Uint8Array
+  constructor(bytes: MemoryBytes, replacement: Uint8Array) {
+    super()
+    this.bytes = bytes
+    this.replacement = replacement
+  }
+  async encrypt(alias: string, bits: number, plain: Uint8Array): Promise<CipherText | null> {
+    let result = await super.encrypt(alias, bits, plain)
+    this.bytes.values.set(FROM, this.replacement)
+    return result
   }
 }

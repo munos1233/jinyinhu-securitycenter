@@ -814,8 +814,12 @@ export class SandboxFiles implements CenterFiles {
     let bytes = encodeUtf8(text)
     let opened = fs.openSync(this.full(path),
       fs.OpenMode.CREATE | fs.OpenMode.READ_WRITE | fs.OpenMode.TRUNC)
-    fs.writeSync(opened.fd, bytes.buffer)
-    fs.closeSync(opened)
+    try {
+      if (fs.writeSync(opened.fd, bytes.buffer) !== bytes.length) throw new Error('short write')
+      fs.fsyncSync(opened.fd)
+    } finally {
+      fs.closeSync(opened)
+    }
   }
 
   rename(from: string, to: string): void {

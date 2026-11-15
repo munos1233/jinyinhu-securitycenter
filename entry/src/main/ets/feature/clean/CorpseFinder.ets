@@ -1,6 +1,6 @@
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { heavyBudgetMs, heavyMaxBytes, heavyMaxFiles } from '../../center/CenterLimits'
-import type { FileHit, FileSource } from '../../center/CenterTypes'
+import type { CleanClass, FileHit, FileSource } from '../../center/CenterTypes'
 import { listInstallers } from '../../engine/InstallerScan'
 import type { InstallerOpen, InstallerScanResult } from '../../engine/InstallerScan'
 
@@ -56,7 +56,7 @@ class Hit implements FileHit {
   name: string = ''
   size: number = 0
   sha256: string = ''
-  clazz: FileHit['clazz'] = 'residue'
+  clazz: CleanClass = 'residue'
   reason: string = ''
   selected: boolean = false
   groupId: string = ''

@@ -1,7 +1,7 @@
 import { hilog } from '@kit.PerformanceAnalysisKit'
 import { CenterError } from '../../center/CenterError'
 import { heavyBudgetMs, heavyMaxBytes, heavyMaxFiles, largeTiers, listMax } from '../../center/CenterLimits'
-import type { DuplicateGroup, FileGrant, FileHit, FileToolReport } from '../../center/CenterTypes'
+import type { CleanClass, DuplicateGroup, FileGrant, FileHit, FileToolReport } from '../../center/CenterTypes'
 import type { InstallerIo, OpenedInstaller } from '../../engine/InstallerScan'
 import { FsInstallerIo } from '../../engine/InstallerScan'
 import type { FileToolContext } from '../../task/Contexts'
@@ -34,7 +34,7 @@ class Hit implements FileHit {
   name: string = ''
   size: number = 0
   sha256: string = ''
-  clazz: FileHit['clazz'] = 'large'
+  clazz: CleanClass = 'large'
   reason: string = ''
   selected: boolean = false
   groupId: string = ''

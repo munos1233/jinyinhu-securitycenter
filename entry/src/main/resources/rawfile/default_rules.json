@@ -1,0 +1,40 @@
+{
+  "version": "2026.11.12",
+  "bundles": [
+    {
+      "bundleName": "com.example.risk",
+      "certAlgo": "platform-fingerprint",
+      "certSha256": "替换为测试包的平台指纹",
+      "level": "risk",
+      "reason": "演示用风险包"
+    }
+  ],
+  "officials": [
+    {
+      "bundleName": "com.example.official",
+      "certAlgo": "platform-fingerprint",
+      "certSha256": ["替换为发行版登记的证书指纹"],
+      "reason": "签名与官方记录不符"
+    }
+  ],
+  "files": [
+    { "sha256": "", "level": "risk", "reason": "" }
+  ],
+  "heuristics": [
+    {
+      "id": "sms-and-contacts",
+      "permissions": ["ohos.permission.RECEIVE_SMS", "ohos.permission.READ_CONTACTS"],
+      "reason": "短信和通讯录"
+    },
+    {
+      "id": "sms-and-call",
+      "permissions": ["ohos.permission.SEND_MESSAGES", "ohos.permission.PLACE_CALL"],
+      "reason": "短信和拨打电话"
+    },
+    {
+      "id": "background-location-and-camera",
+      "permissions": ["ohos.permission.LOCATION_IN_BACKGROUND", "ohos.permission.CAMERA"],
+      "reason": "后台定位和相机"
+    }
+  ]
+}
